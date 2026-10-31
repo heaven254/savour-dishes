@@ -1,0 +1,17 @@
+# A PostgreSQL database for Savour Dishes:  docker compose up -d
+# Then run the app with:
+#   DATABASE_URL=postgresql://savour:YOUR-PASSWORD@127.0.0.1:5432/savour python app.py
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: savour
+      POSTGRES_PASSWORD: ${SD_DB_PASSWORD:?set SD_DB_PASSWORD to a strong password}
+      POSTGRES_DB: savour
+    ports:
+      - "127.0.0.1:5432:5432"      # reachable from this machine only
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
