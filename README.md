@@ -207,5 +207,21 @@ python app.py migrate-to-postgres saviour.db
    if the PostgreSQL database already holds customers or orders. Everyone has to log in again afterwards.
 4. **Back up** with `pg_dump "$DATABASE_URL" > backup.sql` (most hosts also do this for you).
 
-`SD_DB_POOL` (default 10) sets how many database connections the app keeps. For many simultaneous customers, run the app with a production server such as
-`gunicorn app:app` instead of `python app.py`.
+`SD_DB_POOL` (default 10) sets how many database connections the app keeps. For a live site, run it with a production server instead of `python app.py`:
+`gunicorn app:app --workers 1 --threads 8 --bind 0.0.0.0:$PORT` (one worker on purpose: the app keeps a few short-lived counters in memory and sets up the tables on start).
+
+## Deploying on Render
+
+1. Put the project on GitHub. Create a **PostgreSQL** database on Render, then a **Web Service** from the repo.
+2. Web Service settings: **Build command** `pip install -r requirements.txt`; **Start command** `gunicorn app:app --workers 1 --threads 8 --bind 0.0.0.0:$PORT`.
+3. Under **Environment**, add:
+
+| Name | Value |
+|---|---|
+| `DATABASE_URL` | the database's **Internal Database URL** (same region as the web service) |
+| `SD_ADMIN_PASSWORD` | a strong owner password (used the first time only) |
+| `SD_KCB_TILL` | your till number (optional; the owner can also set it in the app) |
+
+   For automatic M-Pesa add `SD_PUBLIC_URL` (your Render address, `https://your-app.onrender.com`) and the `SD_MPESA_*` values listed above.
+4. Don't set `SD_HOST` or `SD_PORT` (Render gives the port). Render serves the site over HTTPS, which customers' location sharing needs.
+5. Render's disk is wiped on every deploy, so keep everything in PostgreSQL, not the SQLite file. Check your database plan's expiry and backups on Render.
