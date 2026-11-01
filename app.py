@@ -35,13 +35,22 @@ SESSION_HOURS = 12
 SERVICES = {"Dine in", "Room service", "Takeaway"}
 ROLES = {"Owner", "Staff"}
 # Dashboard areas. Owners can use all of them; staff can too unless the owner switches one off.
-AREAS = ["overview", "orders", "sales", "purchases", "expenses", "transactions", "team", "menu", "customers"]
+AREAS = ["overview", "today", "orders", "sales", "purchases", "expenses", "transactions", "profit", "team", "menu", "customers", "feedback"]
 PAYMENT_METHODS = ("KCB Till", "Cash")
 REF_RE = re.compile(r"^[A-Z0-9]{8,12}$")         # an M-Pesa confirmation code, e.g. SJK4H2XYZ1
 OWNER_ONLY = "owner"
 NEXT_STATUS = {"Pending": "Preparing", "Preparing": "Served"}
 
-app = Flask(__name__, static_folder=os.path.join(BASE_DIR, "static"), static_url_path="/static")
+def _static_dir():
+    """The website folder. Accepts `static` or `Static`: uploading through some phones/browsers capitalises it,
+    and servers like Render treat the two as different folders."""
+    for name in ("static", "Static"):
+        if os.path.isfile(os.path.join(BASE_DIR, name, "index.html")):
+            return os.path.join(BASE_DIR, name)
+    return os.path.join(BASE_DIR, "static")
+
+
+app = Flask(__name__, static_folder=_static_dir(), static_url_path="/static")
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024  # requests are tiny JSON bodies
 
 # The menu board on the wall: (category, name, price in KES, emoji avatar, description)
@@ -137,7 +146,8 @@ CREATE TABLE IF NOT EXISTS purchases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     item TEXT NOT NULL, supplier TEXT NOT NULL DEFAULT '',
     qty REAL NOT NULL, unit_cost REAL NOT NULL, total INTEGER NOT NULL,
-    date TEXT NOT NULL, recorded_by INTEGER, created_at TEXT NOT NULL
+    date TEXT NOT NULL, recorded_by INTEGER, created_at TEXT NOT NULL,
+    unit TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS expenses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,7 +171,7 @@ CREATE TABLE IF NOT EXISTS staff_access (
 );
 CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id),
+    order_id INTEGER NOT NULL REFERENCES orders(id),
     method TEXT NOT NULL, amount INTEGER NOT NULL,
     reference TEXT, status TEXT NOT NULL DEFAULT 'Pending',
     created_at TEXT NOT NULL, confirmed_by INTEGER, confirmed_at TEXT,
@@ -170,6 +180,24 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE TABLE IF NOT EXISTS mpesa_receipts (
     trans_id TEXT PRIMARY KEY, amount REAL NOT NULL, phone TEXT,
     source TEXT NOT NULL, received_at TEXT NOT NULL, matched_payment INTEGER
+);
+CREATE INDEX IF NOT EXISTS payments_order_idx ON payments(order_id);
+CREATE TABLE IF NOT EXISTS drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL DEFAULT '', service TEXT NOT NULL DEFAULT 'Dine in', location TEXT NOT NULL DEFAULT '',
+    items TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+    created_by INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id),
+    customer_id INTEGER NOT NULL, rating INTEGER, comment TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wastage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item TEXT NOT NULL, qty REAL, unit TEXT NOT NULL DEFAULT '', cost INTEGER NOT NULL,
+    reason TEXT NOT NULL, date TEXT NOT NULL, recorded_by INTEGER, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (
@@ -192,7 +220,7 @@ if USE_PG:
     IntegrityError = (sqlite3.IntegrityError, psycopg.errors.IntegrityError)
 else:
     IntegrityError = (sqlite3.IntegrityError,)
-HAS_ID = {"customers", "staff", "menu", "orders", "order_items", "purchases", "expenses", "price_changes", "payments"}
+HAS_ID = {"customers", "staff", "menu", "orders", "order_items", "purchases", "expenses", "price_changes", "payments", "drafts", "wastage", "feedback"}
 _pool = None
 
 
@@ -390,10 +418,28 @@ def init_db():
     for col, typ in (("checkout_id", "TEXT"), ("note", "TEXT"), ("auto", "INTEGER NOT NULL DEFAULT 0")):
         if col not in have:
             conn.execute(f"ALTER TABLE payments ADD COLUMN {col} {typ}")
+    # an order can now be paid in two parts (split payment): drop the old one-payment-per-order rule
+    if USE_PG:
+        conn.execute("ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_order_id_key")
+    else:
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='payments'").fetchone()
+        if row and "UNIQUE" in row[0].upper():
+            cols = "id, order_id, method, amount, reference, status, created_at, confirmed_by, confirmed_at, checkout_id, note, auto"
+            conn.execute("DROP TABLE IF EXISTS payments_new")
+            conn.execute("""CREATE TABLE payments_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL REFERENCES orders(id),
+                method TEXT NOT NULL, amount INTEGER NOT NULL, reference TEXT, status TEXT NOT NULL DEFAULT 'Pending',
+                created_at TEXT NOT NULL, confirmed_by INTEGER, confirmed_at TEXT,
+                checkout_id TEXT, note TEXT, auto INTEGER NOT NULL DEFAULT 0)""")
+            conn.execute(f"INSERT INTO payments_new ({cols}) SELECT {cols} FROM payments")
+            conn.execute("DROP TABLE payments")
+            conn.execute("ALTER TABLE payments_new RENAME TO payments")
+            conn.execute("CREATE INDEX IF NOT EXISTS payments_order_idx ON payments(order_id)")
     # upgrade for combos
     for table, col, typ in (("menu", "is_combo", "INTEGER NOT NULL DEFAULT 0"),
                             ("order_items", "detail", "TEXT NOT NULL DEFAULT ''"),
-                            ("combo_items", "pos", "INTEGER NOT NULL DEFAULT 0")):
+                            ("combo_items", "pos", "INTEGER NOT NULL DEFAULT 0"),
+                            ("purchases", "unit", "TEXT NOT NULL DEFAULT ''")):
         have = conn.columns(table)
         if col not in have:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
@@ -403,11 +449,14 @@ def init_db():
     if conn.execute("SELECT COUNT(*) FROM staff WHERE role='Owner'").fetchone()[0] == 0:
         conn.execute("UPDATE staff SET role='Owner' WHERE id=(SELECT MIN(id) FROM staff)")
     existing = {r[0] for r in conn.execute("SELECT name FROM menu")}
-    if existing <= OLD_SAMPLE_DISHES:  # brand-new database, or still the old sample menu
+    seeded = conn.execute("SELECT 1 FROM settings WHERE key='menu_seeded'").fetchone()
+    if not seeded and existing <= OLD_SAMPLE_DISHES:  # brand-new database, or still the old sample menu (once only)
         conn.execute("DELETE FROM menu")
         conn.executemany(
             "INSERT INTO menu (category, name, price, emoji, description) VALUES (?,?,?,?,?)", SEED_MENU
         )
+    if not seeded:      # from now on the menu belongs to the owner: adding or removing dishes is never undone on restart
+        conn.execute("INSERT INTO settings (key, value) VALUES ('menu_seeded', '1') ON CONFLICT (key) DO NOTHING")
     if conn.execute("SELECT COUNT(*) FROM staff").fetchone()[0] == 0:
         pw = os.environ.get("SD_ADMIN_PASSWORD")
         default = pw is None
@@ -510,9 +559,46 @@ def menu_json(m):
             "image": "/static/img/" + DISH_PHOTOS[m["name"]] if m["name"] in DISH_PHOTOS else None}
 
 
+def pay_rows_for(order_ids):
+    """{order id: [payment rows]} - an order has one payment, or two when it is paid in two parts (split)."""
+    ids, out = list(order_ids), {}
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        for r in db().execute("SELECT * FROM payments WHERE order_id IN (%s) ORDER BY id" % ",".join("?" * len(chunk)), chunk):
+            out.setdefault(r["order_id"], []).append(r)
+    return out
+
+
+def pay_summary(rows):
+    if not rows:
+        return None
+    parts = [{"id": f"TX{r['id']:04d}", "method": r["method"], "amount": r["amount"], "status": r["status"],
+              "reference": r["reference"], "note": r["note"], "auto": bool(r["auto"])} for r in rows]
+    statuses = {p["status"] for p in parts}
+    till = next((p for p in parts if p["method"] == "KCB Till"), None)
+    return {"method": parts[0]["method"] if len(parts) == 1 else "Split",
+            "status": "Paid" if statuses == {"Paid"} else "Pending" if "Pending" in statuses else "Failed",
+            "reference": till["reference"] if till else None,
+            "note": next((p["note"] for p in parts if p["note"]), None),
+            "auto": bool(till and till["auto"]),
+            "amount": sum(p["amount"] for p in parts),
+            "paid": sum(p["amount"] for p in parts if p["status"] == "Paid"), "parts": parts}
+
+
+def feedback_for(order_ids):
+    ids, out = list(order_ids), {}
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        for r in db().execute("SELECT * FROM feedback WHERE order_id IN (%s)" % ",".join("?" * len(chunk)), chunk):
+            out[r["order_id"]] = r
+    return out
+
+
 def orders_json(rows, geo=False):
     """geo=True adds where the customer can be found (staff only)."""
     out = []
+    pays = pay_rows_for([o["id"] for o in rows])
+    fbs = feedback_for([o["id"] for o in rows])
     for o in rows:
         items = db().execute("SELECT name, qty, detail FROM order_items WHERE order_id=?", (o["id"],)).fetchall()
         row = {
@@ -521,9 +607,8 @@ def orders_json(rows, geo=False):
             "total": o["total"], "service": o["service"], "location": o["location"],
             "status": o["status"], "time": o["created_at"],
             "startedBy": o["started_name"], "servedBy": o["served_name"], "servedAt": o["served_at"],
-            "payment": {"method": o["pay_method"], "status": o["pay_status"], "reference": o["pay_ref"],
-                        "note": o["pay_note"], "auto": bool(o["pay_auto"])}
-                       if o["pay_method"] else None,
+            "payment": pay_summary(pays.get(o["id"])),
+            "feedback": {"rating": fbs[o["id"]]["rating"], "comment": fbs[o["id"]]["comment"]} if o["id"] in fbs else None,
         }
         if geo:
             if o["geo_lat"] is not None:        # shared with this order
@@ -541,10 +626,8 @@ def orders_json(rows, geo=False):
 ORDER_SELECT = ("SELECT o.*, c.name AS cname, c.phone AS phone, "
                 "c.lat AS c_lat, c.lng AS c_lng, c.accuracy AS c_acc, c.location_at AS c_at, "
                 "s1.name AS started_name, s2.name AS served_name, "
-                "p.id AS pay_id, p.method AS pay_method, p.status AS pay_status, p.reference AS pay_ref, "
-                "p.note AS pay_note, p.auto AS pay_auto "
+                "o.id AS _oid "
                 "FROM orders o JOIN customers c ON c.id=o.customer_id "
-                "LEFT JOIN payments p ON p.order_id=o.id "
                 "LEFT JOIN staff s1 ON s1.id=o.started_by "
                 "LEFT JOIN staff s2 ON s2.id=o.served_by ")
 
@@ -725,7 +808,7 @@ def get_menu():
 @app.patch("/api/menu/<int:menu_id>")
 @require("staff")
 def update_menu_item(menu_id):
-    """Switch a dish on/off (needs the Menu section) and/or change its price (needs the Sales section)."""
+    """Switch a dish on/off (needs the Menu section) and/or change its price (needs the Menu or Sales section)."""
     d = body()
     m = db().execute("SELECT * FROM menu WHERE id=?", (menu_id,)).fetchone()
     if not m:
@@ -743,7 +826,7 @@ def update_menu_item(menu_id):
         price = valid_price(d["price"])
         if price is None:
             return err("Enter a whole-number price between 1 and 100,000.")
-        if not can_access(g.user, "sales"):
+        if not (can_access(g.user, "sales") or can_access(g.user, "menu")):
             return err("You don't have access to prices. Ask the owner.", 403)
     conn = db()
     if wants_switch:
@@ -751,6 +834,93 @@ def update_menu_item(menu_id):
     if wants_price and price != m["price"]:
         conn.execute("UPDATE menu SET price=? WHERE id=?", (price, menu_id))
         log_price_change(menu_id, m["name"], m["price"], price)
+    conn.commit()
+    return jsonify({"ok": True})
+
+
+def clean_dish(d, existing=None):
+    """Checks a dish typed in by staff. Returns (fields, None) or (None, error_response).
+    `existing` is the current row when editing: anything left out keeps its old value."""
+    def pick(key, default=""):
+        return d[key] if key in d else (existing[key] if existing is not None else default)
+    name = re.sub(r"\s+", " ", str(pick("name")).strip())
+    if not (1 <= len(name) <= 60):
+        return None, err("Enter the dish name (up to 60 letters).")
+    cat = re.sub(r"\s+", " ", str(d["category"] if "category" in d else (existing["category"] if existing is not None else "")).strip())
+    if not (1 <= len(cat) <= 30):
+        return None, err("Enter a category, for example Ugali or Juices (up to 30 letters).")
+    if cat.lower() == "combos":
+        return None, err("Combos are made in Sales → Combos. Choose another category.")
+    for r in db().execute("SELECT DISTINCT category FROM menu WHERE is_combo=0"):
+        if r["category"].lower() == cat.lower():
+            cat = r["category"]            # same category as an existing one: keep its spelling
+            break
+    price = valid_price(d["price"] if "price" in d else (existing["price"] if existing is not None else None))
+    if price is None:
+        return None, err("Enter a whole-number price between 1 and 100,000.")
+    emoji = str(pick("emoji", "🍽️")).strip() or "🍽️"
+    if len(emoji) > 12:
+        return None, err("The avatar should be a single emoji, like 🍛.")
+    desc = str(pick("description")).strip()
+    if len(desc) > 120:
+        return None, err("Keep the description under 120 letters.")
+    own = existing["id"] if existing is not None else None
+    dup = ("SELECT 1 FROM menu WHERE lower(name)=lower(?)", (name,)) if own is None else \
+          ("SELECT 1 FROM menu WHERE lower(name)=lower(?) AND id != ?", (name, own))
+    if db().execute(*dup).fetchone():
+        return None, err("There is already a dish or combo with that name.", 409)
+    return {"name": name, "category": cat, "price": price, "emoji": emoji, "description": desc}, None
+
+
+@app.post("/api/menu")
+@require("staff", "menu")
+def add_dish():
+    f, e = clean_dish(body())
+    if e:
+        return e
+    conn = db()
+    cur = conn.execute("INSERT INTO menu (category, name, price, emoji, description) VALUES (?,?,?,?,?)",
+                       (f["category"], f["name"], f["price"], f["emoji"], f["description"]))
+    conn.commit()
+    return jsonify({"ok": True, "id": cur.lastrowid}), 201
+
+
+@app.put("/api/menu/<int:menu_id>")
+@require("staff", "menu")
+def edit_dish(menu_id):
+    m = db().execute("SELECT * FROM menu WHERE id=?", (menu_id,)).fetchone()
+    if not m:
+        return err("Dish not found.", 404)
+    if m["is_combo"]:
+        return err("Combos are changed in Sales → Combos.", 409)
+    f, e = clean_dish(body(), m)
+    if e:
+        return e
+    conn = db()
+    conn.execute("UPDATE menu SET category=?, name=?, price=?, emoji=?, description=? WHERE id=?",
+                 (f["category"], f["name"], f["price"], f["emoji"], f["description"], menu_id))
+    if f["price"] != m["price"]:
+        log_price_change(menu_id, f["name"], m["price"], f["price"])
+    conn.commit()
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/menu/<int:menu_id>")
+@require("staff", "menu")
+def delete_dish(menu_id):
+    """Removes a dish from the menu. Past orders keep their own copy of its name and price."""
+    m = db().execute("SELECT * FROM menu WHERE id=?", (menu_id,)).fetchone()
+    if not m:
+        return err("Dish not found.", 404)
+    if m["is_combo"]:
+        return err("Combos are removed in Sales → Combos.", 409)
+    used = db().execute("SELECT c.name FROM combo_items i JOIN menu c ON c.id=i.combo_id WHERE i.menu_id=?",
+                        (menu_id,)).fetchall()
+    if used:
+        return err("It is part of the combo " + ", ".join(f"“{r['name']}”" for r in used)
+                   + ". Change or remove the combo first, or just mark the dish unavailable.", 409)
+    conn = db()
+    conn.execute("DELETE FROM menu WHERE id=?", (menu_id,))
     conn.commit()
     return jsonify({"ok": True})
 
@@ -867,10 +1037,10 @@ def place_order():
     if e:
         return e
     pay = d.get("payment", {"method": "Cash"})      # no choice sent = pay cash
-    if not isinstance(pay, dict) or pay.get("method") not in PAYMENT_METHODS:
-        return err("Choose how you will pay: KCB Till or Cash.")
+    if not isinstance(pay, dict) or pay.get("method") not in PAYMENT_METHODS + ("Split",):
+        return err("Choose how you will pay: KCB Till, Cash or both.")
     ref = None
-    if pay["method"] == "KCB Till" and str(pay.get("reference") or "").strip():
+    if pay["method"] in ("KCB Till", "Split") and str(pay.get("reference") or "").strip():
         ref, e = clean_ref(pay.get("reference"))
         if e:
             return e
@@ -899,6 +1069,14 @@ def place_order():
     if isinstance(shown, int) and not isinstance(shown, bool) and shown != total:
         return err("Some prices have changed. Please check your order total and place it again.", 409)
 
+    if pay["method"] == "Split":        # part in cash, the rest by till
+        cash = pay.get("cash")
+        if isinstance(cash, bool) or not isinstance(cash, (int, float)) or not (1 <= cash < total):
+            return err("For a split payment, enter how much you will pay in cash. It must be less than the total.")
+        cash = int(round(cash))
+        pay_rows = [("Cash", cash, None), ("KCB Till", total - cash, ref)]
+    else:
+        pay_rows = [(pay["method"], total, ref)]
     conn = db()
     if ref and ref_in_use(ref):
         return err("That M-Pesa code has already been used for another payment.", 409)
@@ -912,8 +1090,9 @@ def place_order():
         "INSERT INTO order_items (order_id, menu_id, name, price, qty, detail) VALUES (?,?,?,?,?,?)",
         [(order_id, *line) for line in lines],
     )
-    conn.execute("INSERT INTO payments (order_id, method, amount, reference, created_at) VALUES (?,?,?,?,?)",
-                 (order_id, pay["method"], total, ref, now()))
+    for method, amount, reference in pay_rows:
+        conn.execute("INSERT INTO payments (order_id, method, amount, reference, created_at) VALUES (?,?,?,?,?)",
+                     (order_id, method, amount, reference, now()))
     conn.commit()
     return jsonify({"ok": True, "id": f"SD{order_id:04d}", "total": total, "payment": pay["method"]}), 201
 
@@ -952,6 +1131,59 @@ def update_order(code):
                      (new, g.user["id"], now(), order_id))
     db().commit()
     return jsonify({"ok": True})
+
+
+# ---------- customer feedback ----------
+@app.post("/api/orders/<code>/feedback")
+@require("customer")
+def give_feedback(code):
+    """Optional: a star rating (1-5) and/or a few words about a served order. Can be changed later."""
+    m = re.fullmatch(r"SD(\d{1,9})", code)
+    o = m and db().execute("SELECT * FROM orders WHERE id=? AND customer_id=?", (int(m.group(1)), g.user["id"])).fetchone()
+    if not o:
+        return err("Order not found.", 404)
+    if o["status"] != "Served":
+        return err("You can rate an order once it has been served.", 409)
+    d = body()
+    rating = d.get("rating")
+    if rating in (None, ""):
+        rating = None
+    elif type(rating) is not int or not (1 <= rating <= 5):
+        return err("Choose between 1 and 5 stars.")
+    comment = str(d.get("comment") or "").strip()
+    if len(comment) > 500:
+        return err("Please keep your comment under 500 characters.")
+    if rating is None and not comment:
+        return err("Choose a star rating or write a few words.")
+    t = now()
+    if db().execute("SELECT id FROM feedback WHERE order_id=?", (o["id"],)).fetchone():
+        db().execute("UPDATE feedback SET rating=?, comment=?, updated_at=? WHERE order_id=?", (rating, comment, t, o["id"]))
+    else:
+        db().execute("INSERT INTO feedback (order_id, customer_id, rating, comment, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                     (o["id"], g.user["id"], rating, comment, t, t))
+    db().commit()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/feedback")
+@require("staff", "feedback")
+def list_feedback():
+    name, first = get_range()
+    if name is None:
+        return err("Invalid period.")
+    rows = db().execute("SELECT f.*, c.name AS cname FROM feedback f JOIN customers c ON c.id=f.customer_id "
+                        "ORDER BY f.updated_at DESC").fetchall()
+    rows = [r for r in rows if in_range(local_date(r["updated_at"]), first)]
+    rated = [r["rating"] for r in rows if r["rating"]]
+    dist = {str(n): rated.count(n) for n in range(1, 6)}
+    out = []
+    for r in rows:
+        its = db().execute("SELECT name, qty FROM order_items WHERE order_id=?", (r["order_id"],)).fetchall()
+        out.append({"order": f"SD{r['order_id']:04d}", "customer": r["cname"], "rating": r["rating"], "comment": r["comment"],
+                    "items": ", ".join(f"{i['qty']}× {i['name']}" for i in its), "time": r["updated_at"]})
+    return jsonify({"count": len(rows), "rated": len(rated), "average": round(sum(rated) / len(rated), 1) if rated else None,
+                    "happy": round(sum(1 for x in rated if x >= 4) / len(rated) * 100) if rated else None,
+                    "distribution": dist, "rows": out})
 
 
 # ---------- payments: KCB Till or cash ----------
@@ -1001,10 +1233,11 @@ def add_payment_ref(code):
     """The customer enters the M-Pesa code after paying to the till."""
     m = re.fullmatch(r"SD(\d{1,9})", code)
     p = m and db().execute("SELECT p.* FROM payments p JOIN orders o ON o.id=p.order_id "
-                           "WHERE o.id=? AND o.customer_id=?", (int(m.group(1)), g.user["id"])).fetchone()
+                           "WHERE o.id=? AND o.customer_id=? AND p.method='KCB Till' ORDER BY p.id LIMIT 1",
+                           (int(m.group(1)), g.user["id"])).fetchone()
     if not p:
         return err("Order not found.", 404)
-    if p["method"] != "KCB Till" or p["status"] == "Paid":
+    if p["status"] == "Paid":
         return err("This payment can't be changed.", 409)
     ref, e = clean_ref(body().get("reference"))
     if e:
@@ -1130,10 +1363,11 @@ def stk_push(code):
         return err("Automatic M-Pesa isn't set up yet. Pay to the till and enter your code.", 503)
     m = re.fullmatch(r"SD(\d{1,9})", code)
     p = m and db().execute("SELECT p.* FROM payments p JOIN orders o ON o.id=p.order_id "
-                           "WHERE o.id=? AND o.customer_id=?", (int(m.group(1)), g.user["id"])).fetchone()
+                           "WHERE o.id=? AND o.customer_id=? AND p.method='KCB Till' ORDER BY p.id LIMIT 1",
+                           (int(m.group(1)), g.user["id"])).fetchone()
     if not p:
         return err("Order not found.", 404)
-    if p["method"] != "KCB Till" or p["status"] == "Paid":
+    if p["status"] == "Paid":
         return err("This order doesn't need a payment prompt.", 409)
     phone = normalize_phone(body().get("phone") or g.user["phone"])
     if not phone or not re.fullmatch(r"\+254[17]\d{8}", phone):
@@ -1301,11 +1535,230 @@ def update_transaction(tx):
     return jsonify({"ok": True})
 
 
+# ---------- split payments, counter sales and drafts ----------
+def parse_parts(raw):
+    """Payment parts typed by staff: [{method, amount, status?, reference?}]. Returns (parts, None) or (None, error)."""
+    if not isinstance(raw, list) or not (1 <= len(raw) <= 2):
+        return None, err("Choose one or two ways of paying.")
+    parts, seen = [], set()
+    for p in raw:
+        if not isinstance(p, dict) or p.get("method") not in PAYMENT_METHODS:
+            return None, err("Unknown payment method.")
+        if p["method"] in seen:
+            return None, err("Use each payment method only once.")
+        seen.add(p["method"])
+        amount = number(p.get("amount"), 1, 10_000_000)
+        if amount is None:
+            return None, err("Enter a valid amount for each payment.")
+        status = p.get("status") or "Pending"
+        if status not in ("Paid", "Pending"):
+            return None, err("Unknown payment status.")
+        ref = None
+        if p["method"] == "KCB Till" and str(p.get("reference") or "").strip():
+            ref, e = clean_ref(p.get("reference"))
+            if e:
+                return None, e
+        parts.append({"method": p["method"], "amount": round(amount), "status": status, "ref": ref})
+    return parts, None
+
+
+def apply_parts(order_id, total, parts):
+    """Replaces an order's payments that are not confirmed yet. Returns an error response, or None. The caller commits."""
+    conn = db()
+    paid = [r for r in conn.execute("SELECT * FROM payments WHERE order_id=? AND status='Paid'", (order_id,)).fetchall()]
+    left = total - sum(r["amount"] for r in paid)
+    if left <= 0:
+        return err("This order is already fully paid.", 409)
+    if sum(p["amount"] for p in parts) != left:
+        return err(f"The payments must add up to KES {left:,}.")
+    if {p["method"] for p in parts} & {r["method"] for r in paid}:
+        return err("That order already has a confirmed payment by that method.", 409)
+    for p in parts:
+        if p["ref"] and conn.execute("SELECT id FROM payments WHERE reference=? AND status!='Failed' AND order_id!=?",
+                                     (p["ref"], order_id)).fetchone():
+            return err("That M-Pesa code has already been used for another payment.", 409)
+    conn.execute("DELETE FROM payments WHERE order_id=? AND status!='Paid'", (order_id,))
+    for p in parts:
+        done = p["status"] == "Paid"
+        conn.execute("INSERT INTO payments (order_id, method, amount, reference, status, created_at, confirmed_by, confirmed_at) "
+                     "VALUES (?,?,?,?,?,?,?,?)",
+                     (order_id, p["method"], p["amount"], p["ref"], p["status"], now(),
+                      g.user["id"] if done else None, now() if done else None))
+    return None
+
+
+@app.put("/api/orders/<code>/payments")
+@require("staff", "transactions")
+def set_order_payments(code):
+    """Split an order's payment between cash and till (or change how it is paid). Confirmed parts stay as they are."""
+    m = re.fullmatch(r"SD(\d{1,9})", code)
+    o = m and db().execute("SELECT * FROM orders WHERE id=?", (int(m.group(1)),)).fetchone()
+    if not o:
+        return err("Order not found.", 404)
+    parts, e = parse_parts(body().get("parts"))
+    if e:
+        return e
+    e = apply_parts(o["id"], o["total"], parts)
+    if e:
+        db().rollback()
+        return e
+    db().commit()
+    return jsonify({"ok": True})
+
+
+def walkin_id():
+    """Counter sales belong to one shared 'Walk-in customer' that nobody can sign in as."""
+    q = "SELECT id FROM customers WHERE phone='walk-in'"
+    r = db().execute(q).fetchone()
+    if not r:
+        try:
+            db().execute("INSERT INTO customers (name, phone, created_at) VALUES ('Walk-in customer', 'walk-in', ?)", (now(),))
+            db().commit()
+        except IntegrityError:
+            db().rollback()
+        r = db().execute(q).fetchone()
+    return r["id"]
+
+
+def clean_lines(items):
+    """[{id, qty}] -> ({menu id: qty}, None) or (None, error)."""
+    if not isinstance(items, list) or not (1 <= len(items) <= 30):
+        return None, err("Add at least one dish.")
+    wanted = {}
+    for it in items:
+        if not isinstance(it, dict) or type(it.get("id")) is not int or type(it.get("qty")) is not int:
+            return None, err("Invalid items.")
+        if not (1 <= it["qty"] <= 50):
+            return None, err("Quantity must be between 1 and 50.")
+        wanted[it["id"]] = wanted.get(it["id"], 0) + it["qty"]
+    return wanted, None
+
+
+def draft_fields(d):
+    """Validated draft contents as a tuple, or (None, error)."""
+    wanted, e = clean_lines(d.get("items"))
+    if e:
+        return None, e
+    if not set(wanted) <= {m["id"] for m in load_menu()}:
+        return None, err("A dish in this draft does not exist.")
+    service = d.get("service") or "Dine in"
+    if service not in SERVICES:
+        return None, err("Choose dine in, room service or takeaway.")
+    label, location, note = (str(d.get(k) or "").strip() for k in ("label", "location", "note"))
+    if len(label) > 40 or len(location) > 40 or len(note) > 120:
+        return None, err("The name, table or note is too long.")
+    return (label, service, location, json.dumps([{"id": i, "qty": q} for i, q in wanted.items()]), note), None
+
+
+def draft_json(r, menu):
+    lines, total, problems = [], 0, []
+    for it in json.loads(r["items"]):
+        m = menu.get(it["id"])
+        if not m:
+            problems.append("A dish in this draft was removed from the menu.")
+            continue
+        lines.append({"id": m["id"], "name": m["name"], "price": m["price"], "qty": it["qty"]})
+        total += m["price"] * it["qty"]
+        if not m["available"]:
+            problems.append(f"{m['name']} is switched off.")
+    return {"id": r["id"], "label": r["label"], "service": r["service"], "location": r["location"], "note": r["note"],
+            "items": lines, "total": total, "problems": problems, "by": r["by_name"], "updated": r["updated_at"]}
+
+
+@app.get("/api/drafts")
+@require("staff", "sales")
+def list_drafts():
+    menu = {m["id"]: m for m in load_menu()}
+    rows = db().execute("SELECT d.*, s.name AS by_name FROM drafts d LEFT JOIN staff s ON s.id=d.created_by "
+                        "ORDER BY d.updated_at DESC, d.id DESC").fetchall()
+    return jsonify([draft_json(r, menu) for r in rows])
+
+
+@app.post("/api/drafts")
+@require("staff", "sales")
+def add_draft():
+    f, e = draft_fields(body())
+    if e:
+        return e
+    t = now()
+    cur = db().execute("INSERT INTO drafts (label, service, location, items, note, created_by, created_at, updated_at) "
+                       "VALUES (?,?,?,?,?,?,?,?)", (*f, g.user["id"], t, t))
+    db().commit()
+    return jsonify({"ok": True, "id": cur.lastrowid}), 201
+
+
+@app.put("/api/drafts/<int:did>")
+@require("staff", "sales")
+def update_draft(did):
+    f, e = draft_fields(body())
+    if e:
+        return e
+    cur = db().execute("UPDATE drafts SET label=?, service=?, location=?, items=?, note=?, updated_at=? WHERE id=?",
+                       (*f, now(), did))
+    db().commit()
+    return jsonify({"ok": True, "id": did}) if cur.rowcount else err("Draft not found.", 404)
+
+
+@app.delete("/api/drafts/<int:did>")
+@require("staff", "sales")
+def delete_draft(did):
+    cur = db().execute("DELETE FROM drafts WHERE id=?", (did,))
+    db().commit()
+    return jsonify({"ok": True}) if cur.rowcount else err("Draft not found.", 404)
+
+
+@app.post("/api/sales")
+@require("staff", "sales")
+def new_sale():
+    """A counter sale: dishes sold across the counter, recorded as served at once. Can be paid in cash, by till, or split."""
+    d = body()
+    wanted, e = clean_lines(d.get("items"))
+    if e:
+        return e
+    service = d.get("service") or "Takeaway"
+    location = str(d.get("location") or "").strip() or "Counter"
+    if service not in SERVICES:
+        return err("Choose dine in, room service or takeaway.")
+    if len(location) > 40:
+        return err("The table or room is too long.")
+    menu = {m["id"]: m for m in load_menu()}
+    lines, total = [], 0
+    for menu_id, qty in wanted.items():
+        m = menu.get(menu_id)
+        if not m:
+            return err("A dish in this sale does not exist.")
+        if not m["available"]:
+            return err(f"{m['name']} is currently switched off. Remove it, or switch it on in Menu.", 409)
+        detail = ", ".join(f"{i['qty']}× {i['name']}" for i in m["items"]) if m["combo"] else ""
+        lines.append((m["id"], m["name"], m["price"], qty, detail))
+        total += m["price"] * qty
+    parts, e = parse_parts(d.get("parts") or [{"method": "Cash", "amount": total, "status": "Paid"}])
+    if e:
+        return e
+    if sum(p["amount"] for p in parts) != total:
+        return err(f"The payments must add up to the total, KES {total:,}.")
+    conn, t, uid = db(), now(), g.user["id"]
+    cur = conn.execute(
+        "INSERT INTO orders (customer_id, service, location, total, status, created_at, started_by, served_by, served_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)", (walkin_id(), service, location, total, "Served", t, uid, uid, t))
+    order_id = cur.lastrowid
+    conn.executemany("INSERT INTO order_items (order_id, menu_id, name, price, qty, detail) VALUES (?,?,?,?,?,?)",
+                     [(order_id, *line) for line in lines])
+    e = apply_parts(order_id, total, parts)
+    if e:
+        conn.rollback()
+        return e
+    if type(d.get("draft_id")) is int:
+        conn.execute("DELETE FROM drafts WHERE id=?", (d["draft_id"],))
+    conn.commit()
+    return jsonify({"ok": True, "id": f"SD{order_id:04d}", "total": total}), 201
+
+
 # ---------- customers (staff only) ----------
 @app.get("/api/customers")
 @require("staff", "customers")
 def list_customers():
-    rows = db().execute("SELECT * FROM customers ORDER BY id DESC").fetchall()
+    rows = db().execute("SELECT * FROM customers WHERE phone != 'walk-in' ORDER BY id DESC").fetchall()
     return jsonify([{"name": r["name"], "phone": r["phone"], "joined": r["created_at"],
                      "location": {"lat": r["lat"], "lng": r["lng"], "accuracy": r["accuracy"], "time": r["location_at"]}
                                  if r["lat"] is not None else None}
@@ -1315,6 +1768,7 @@ def list_customers():
 # ---------- business records & reports (managers only) ----------
 TZ_OFFSET = timedelta(hours=float(os.environ.get("SD_TZ_HOURS", "3")))  # default: East Africa Time
 EXPENSE_CATEGORIES = ["Rent", "Salaries", "Utilities", "Transport", "Repairs", "Marketing", "Other"]
+WASTE_REASONS = ["Spoiled", "Burnt or overcooked", "Unsold leftovers", "Returned by customer", "Spilled or dropped", "Expired", "Other"]
 RANGES = ("today", "week", "month", "all")
 
 
@@ -1385,7 +1839,7 @@ def report_overview():
     daily = {}
 
     def day(dt):
-        return daily.setdefault(dt.isoformat(), {"date": dt.isoformat(), "sales": 0, "spend": 0})
+        return daily.setdefault(dt.isoformat(), {"date": dt.isoformat(), "sales": 0, "purchases": 0, "expenses": 0, "spend": 0})
 
     if first:
         cursor = first
@@ -1396,8 +1850,10 @@ def report_overview():
         day(local_date(o["served_at"] or o["created_at"]))["sales"] += o["total"]
     for p in purchases:
         day(parse_date(p["date"]))["spend"] += p["total"]
+        day(parse_date(p["date"]))["purchases"] += p["total"]
     for e in expenses:
         day(parse_date(e["date"]))["spend"] += e["amount"]
+        day(parse_date(e["date"]))["expenses"] += e["amount"]
     series = sorted(daily.values(), key=lambda x: x["date"])[-31:]
 
     sold_ids = {o["id"] for o in sold}
@@ -1416,9 +1872,241 @@ def report_overview():
 
     return jsonify({
         "range": name, "sales": sales, "purchases": total_purchases, "expenses": total_expenses,
+        "wastage": wastage_block(first)["total"],
         "net": sales - total_purchases - total_expenses,
         "average": round(sales / len(sold)) if sold else 0,
         "orders": counts, "daily": series, "topDishes": top, "expenseByCategory": by_category,
+    })
+
+
+# ---------- profit & loss ----------
+PNL_RECORD_LIMIT = 500
+
+
+def utc_bounds(d1, d2):
+    """The UTC timestamps that cover local days d1..d2 inclusive."""
+    f = "%Y-%m-%dT%H:%M:%SZ"
+    return ((datetime.combine(d1, datetime.min.time()) - TZ_OFFSET).strftime(f),
+            (datetime.combine(d2 + timedelta(days=1), datetime.min.time()) - TZ_OFFSET).strftime(f))
+
+
+def pnl_totals(d1, d2):
+    lo, hi = utc_bounds(d1, d2)
+    s = db().execute("SELECT COUNT(*) AS n, COALESCE(SUM(total),0) AS t FROM orders WHERE status='Served' "
+                     "AND COALESCE(served_at, created_at) >= ? AND COALESCE(served_at, created_at) < ?", (lo, hi)).fetchone()
+    p = db().execute("SELECT COALESCE(SUM(total),0) AS t FROM purchases WHERE date >= ? AND date <= ?",
+                     (d1.isoformat(), d2.isoformat())).fetchone()["t"]
+    e = db().execute("SELECT COALESCE(SUM(amount),0) AS t FROM expenses WHERE date >= ? AND date <= ?",
+                     (d1.isoformat(), d2.isoformat())).fetchone()["t"]
+    sales, p, e = int(s["t"]), int(p), int(e)
+    return {"sales": sales, "orders": s["n"], "purchases": p, "expenses": e, "grossProfit": sales - p, "netProfit": sales - p - e}
+
+
+@app.get("/api/reports/pnl")
+@require("staff", "profit")
+def report_pnl():
+    """Profit & loss for any period: ?from=YYYY-MM-DD&to=YYYY-MM-DD (local days, both included)."""
+    d1, d2 = parse_date(request.args.get("from")), parse_date(request.args.get("to"))
+    if not d1 or not d2 or d1 > d2:
+        return err("Choose a start day that is on or before the end day.")
+    if (d2 - d1).days > 3660:
+        return err("Please choose a period of 10 years or less.")
+    lo, hi = utc_bounds(d1, d2)
+    conn = db()
+    served = "o.status='Served' AND COALESCE(o.served_at, o.created_at) >= ? AND COALESCE(o.served_at, o.created_at) < ?"
+
+    cur = pnl_totals(d1, d2)
+    days = (d2 - d1).days + 1
+    prev = pnl_totals(d1 - timedelta(days=days), d1 - timedelta(days=1))     # the same number of days just before
+
+    # money received for the orders sold in this period
+    pay_rows = conn.execute(
+        "SELECT p.method, p.status, COALESCE(SUM(p.amount),0) AS amt, COUNT(*) AS n FROM payments p "
+        "JOIN orders o ON o.id=p.order_id WHERE " + served + " GROUP BY p.method, p.status", (lo, hi)).fetchall()
+    received = {"Cash": 0, "KCB Till": 0}
+    waiting = 0
+    recorded = 0
+    for r in pay_rows:
+        recorded += int(r["amt"])
+        if r["status"] == "Paid":
+            received[r["method"]] = received.get(r["method"], 0) + int(r["amt"])
+        else:
+            waiting += int(r["amt"])
+    payments = {"cash": received.get("Cash", 0), "till": received.get("KCB Till", 0),
+                "notConfirmed": waiting, "notRecorded": max(cur["sales"] - recorded, 0)}
+
+    # what sold
+    items = conn.execute(
+        "SELECT oi.name AS name, oi.qty AS qty, oi.price AS price, COALESCE(m.category, 'Other') AS cat "
+        "FROM order_items oi JOIN orders o ON o.id=oi.order_id LEFT JOIN menu m ON m.id=oi.menu_id WHERE " + served,
+        (lo, hi)).fetchall()
+    dishes, cats = {}, {}
+    for it in items:
+        d = dishes.setdefault(it["name"], {"name": it["name"], "qty": 0, "revenue": 0})
+        d["qty"] += it["qty"]; d["revenue"] += it["qty"] * it["price"]
+        cats[it["cat"]] = cats.get(it["cat"], 0) + it["qty"] * it["price"]
+
+    exp_rows = conn.execute("SELECT category, COALESCE(SUM(amount),0) AS amt FROM expenses WHERE date >= ? AND date <= ? "
+                            "GROUP BY category", (d1.isoformat(), d2.isoformat())).fetchall()
+    sup_rows = conn.execute("SELECT item, COALESCE(SUM(total),0) AS amt FROM purchases WHERE date >= ? AND date <= ? "
+                            "GROUP BY item", (d1.isoformat(), d2.isoformat())).fetchall()
+
+    # over time: by day, or by month for long periods
+    monthly = days > 62
+    buckets = {}
+
+    def bucket(day):
+        key = day.strftime("%Y-%m") if monthly else day.isoformat()
+        return buckets.setdefault(key, {"label": key, "sales": 0, "purchases": 0, "expenses": 0})
+    cursor = d1
+    while cursor <= d2:
+        bucket(cursor)
+        cursor += timedelta(days=1)
+    sold_rows = conn.execute(
+        "SELECT o.id AS id, o.total AS total, COALESCE(o.served_at, o.created_at) AS at, c.name AS cname, c.phone AS phone "
+        "FROM orders o JOIN customers c ON c.id=o.customer_id WHERE " + served + " ORDER BY at DESC, o.id DESC", (lo, hi)).fetchall()
+    sale_pays = {k: pay_summary(v) for k, v in pay_rows_for([o["id"] for o in sold_rows[:PNL_RECORD_LIMIT]]).items()}
+    w_rows = conn.execute("SELECT reason, COALESCE(SUM(cost),0) AS amt FROM wastage WHERE date >= ? AND date <= ? GROUP BY reason",
+                          (d1.isoformat(), d2.isoformat())).fetchall()
+    w_total = sum(int(r["amt"]) for r in w_rows)
+    w_prev = int(conn.execute("SELECT COALESCE(SUM(cost),0) AS t FROM wastage WHERE date >= ? AND date <= ?",
+                              ((d1 - timedelta(days=days)).isoformat(), (d1 - timedelta(days=1)).isoformat())).fetchone()["t"])
+    for o in sold_rows:
+        bucket(local_date(o["at"]))["sales"] += o["total"]
+    pur = conn.execute("SELECT p.*, s.name AS by_name FROM purchases p LEFT JOIN staff s ON s.id=p.recorded_by "
+                       "WHERE p.date >= ? AND p.date <= ? ORDER BY p.date DESC, p.id DESC",
+                       (d1.isoformat(), d2.isoformat())).fetchall()
+    exp = conn.execute("SELECT e.*, s.name AS by_name FROM expenses e LEFT JOIN staff s ON s.id=e.recorded_by "
+                       "WHERE e.date >= ? AND e.date <= ? ORDER BY e.date DESC, e.id DESC",
+                       (d1.isoformat(), d2.isoformat())).fetchall()
+    for p in pur:
+        bucket(parse_date(p["date"]))["purchases"] += p["total"]
+    for e in exp:
+        bucket(parse_date(e["date"]))["expenses"] += e["amount"]
+    timeline = sorted(buckets.values(), key=lambda b: b["label"])
+    for b in timeline:
+        b["net"] = b["sales"] - b["purchases"] - b["expenses"]
+
+    return jsonify({
+        "from": d1.isoformat(), "to": d2.isoformat(), "days": days, "by": "month" if monthly else "day",
+        "current": cur, "previous": prev,
+        "average": round(cur["sales"] / cur["orders"]) if cur["orders"] else 0,
+        "margin": round(cur["netProfit"] / cur["sales"] * 100, 1) if cur["sales"] else None,
+        "payments": payments,
+        "wastage": {"total": w_total, "previous": w_prev,
+                    "byReason": sorted(({"reason": r["reason"], "amount": int(r["amt"])} for r in w_rows), key=lambda x: -x["amount"]),
+                    "percentOfPurchases": round(w_total / cur["purchases"] * 100, 1) if cur["purchases"] else None},
+        "expensesByCategory": sorted(({"category": r["category"], "amount": int(r["amt"])} for r in exp_rows), key=lambda x: -x["amount"]),
+        "purchasesByItem": sorted(({"item": r["item"], "amount": int(r["amt"])} for r in sup_rows), key=lambda x: -x["amount"])[:10],
+        "salesByCategory": sorted(({"category": k, "amount": v} for k, v in cats.items()), key=lambda x: -x["amount"]),
+        "topDishes": sorted(dishes.values(), key=lambda x: (-x["revenue"], x["name"]))[:10],
+        "timeline": timeline,
+        "records": {
+            "limit": PNL_RECORD_LIMIT,
+            "sales": [{"id": f"SD{o['id']:04d}", "time": o["at"], "customer": o["cname"], "phone": o["phone"],
+                       "total": o["total"], "method": (sale_pays.get(o["id"]) or {}).get("method"),
+                       "paid": (sale_pays[o["id"]]["status"] == "Paid") if o["id"] in sale_pays else None}
+                      for o in sold_rows[:PNL_RECORD_LIMIT]],
+            "purchases": [{"date": p["date"], "item": p["item"], "supplier": p["supplier"], "qty": p["qty"], "unit": p["unit"],
+                           "unitCost": p["unit_cost"], "total": p["total"], "by": p["by_name"]} for p in pur[:PNL_RECORD_LIMIT]],
+            "expenses": [{"date": e["date"], "category": e["category"], "description": e["description"],
+                          "amount": e["amount"], "by": e["by_name"]} for e in exp[:PNL_RECORD_LIMIT]],
+            "counts": {"sales": len(sold_rows), "purchases": len(pur), "expenses": len(exp)},
+        },
+    })
+
+
+# ---------- business today ----------
+@app.get("/api/reports/today")
+@require("staff", "today")
+def report_today():
+    """What happened in the business on one day (today unless ?date=YYYY-MM-DD): money, orders, hours, and a timeline."""
+    day = parse_date(request.args.get("date")) if request.args.get("date") else today_local()
+    if day is None or day > today_local():
+        return err("Choose a day that is today or earlier.")
+    lo, hi = utc_bounds(day, day)
+    conn = db()
+    cur, before = pnl_totals(day, day), pnl_totals(day - timedelta(days=1), day - timedelta(days=1))
+    q = lambda sql, *args: conn.execute(sql, args).fetchall()
+
+    served = q("SELECT o.id, o.total, o.location, COALESCE(o.served_at, o.created_at) AS at, c.name AS cname, c.phone AS phone, "
+               "s.name AS sname FROM orders o JOIN customers c ON c.id=o.customer_id LEFT JOIN staff s ON s.id=o.served_by "
+               "WHERE o.status='Served' AND COALESCE(o.served_at, o.created_at) >= ? AND COALESCE(o.served_at, o.created_at) < ? "
+               "ORDER BY at DESC", lo, hi)
+    placed = q("SELECT o.id, o.total, o.status, o.created_at, c.name AS cname, c.phone AS phone FROM orders o "
+               "JOIN customers c ON c.id=o.customer_id WHERE o.created_at >= ? AND o.created_at < ? ORDER BY o.id DESC", lo, hi)
+    counts = {"placed": len(placed), "pending": 0, "preparing": 0, "served": 0}
+    for o in placed:
+        counts[o["status"].lower()] += 1
+    open_now = conn.execute("SELECT COUNT(*) FROM orders WHERE status IN ('Pending','Preparing')").fetchone()[0]
+
+    hours = {h: {"hour": h, "sales": 0, "orders": 0} for h in range(24)}
+    team = {}
+    for o in served:
+        h = (datetime.strptime(o["at"], "%Y-%m-%dT%H:%M:%SZ") + TZ_OFFSET).hour
+        hours[h]["sales"] += o["total"]; hours[h]["orders"] += 1
+        t = team.setdefault(o["sname"] or "—", {"name": o["sname"] or "—", "served": 0, "sales": 0})
+        t["served"] += 1; t["sales"] += o["total"]
+
+    items = q("SELECT oi.name AS name, oi.qty AS qty, oi.price AS price FROM order_items oi JOIN orders o ON o.id=oi.order_id "
+              "WHERE o.status='Served' AND COALESCE(o.served_at, o.created_at) >= ? AND COALESCE(o.served_at, o.created_at) < ?", lo, hi)
+    dishes = {}
+    for it in items:
+        d = dishes.setdefault(it["name"], {"name": it["name"], "qty": 0, "revenue": 0})
+        d["qty"] += it["qty"]; d["revenue"] += it["qty"] * it["price"]
+
+    money_in = q("SELECT p.id, p.method, p.amount, p.auto, p.confirmed_at, o.id AS oid, s.name AS sname FROM payments p "
+                 "JOIN orders o ON o.id=p.order_id LEFT JOIN staff s ON s.id=p.confirmed_by "
+                 "WHERE p.status='Paid' AND p.confirmed_at >= ? AND p.confirmed_at < ? ORDER BY p.confirmed_at DESC", lo, hi)
+    received = {"cash": 0, "till": 0}
+    for p in money_in:
+        received["cash" if p["method"] == "Cash" else "till"] += p["amount"]
+    waiting = conn.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments WHERE status='Pending'").fetchone()
+
+    iso = day.isoformat()
+    buys = q("SELECT p.*, s.name AS sname FROM purchases p LEFT JOIN staff s ON s.id=p.recorded_by WHERE p.date=? ORDER BY p.id DESC", iso)
+    spends = q("SELECT e.*, s.name AS sname FROM expenses e LEFT JOIN staff s ON s.id=e.recorded_by WHERE e.date=? ORDER BY e.id DESC", iso)
+    waste = q("SELECT w.*, s.name AS sname FROM wastage w LEFT JOIN staff s ON s.id=w.recorded_by WHERE w.date=? ORDER BY w.id DESC", iso)
+    wasted = sum(w["cost"] for w in waste)
+
+    feed = []
+    code = lambda i: f"SD{i:04d}"
+    for o in placed:
+        if o["phone"] != "walk-in":
+            feed.append({"time": o["created_at"], "type": "order", "text": f"{code(o['id'])} placed by {o['cname']}", "amount": o["total"]})
+    for o in served:
+        who = f" by {o['sname']}" if o["sname"] else ""
+        feed.append({"time": o["at"], "type": "sale" if o["phone"] == "walk-in" else "served",
+                     "text": (f"Counter sale {code(o['id'])}" if o["phone"] == "walk-in" else f"{code(o['id'])} served to {o['cname']}") + who,
+                     "amount": o["total"]})
+    for p in money_in:
+        who = "M-Pesa (automatic)" if p["auto"] else p["sname"]
+        feed.append({"time": p["confirmed_at"], "type": "payment",
+                     "text": f"{p['method']} payment received for {code(p['oid'])}" + (f" · {who}" if who else ""), "amount": p["amount"]})
+    for p in buys:
+        feed.append({"time": p["created_at"], "type": "purchase", "text": f"Bought {p['item']}" + (f" from {p['supplier']}" if p["supplier"] else ""), "amount": p["total"]})
+    for e in spends:
+        feed.append({"time": e["created_at"], "type": "expense", "text": f"{e['category']}: {e['description']}", "amount": e["amount"]})
+    for w in waste:
+        feed.append({"time": w["created_at"], "type": "waste", "text": f"Wasted {w['item']} ({w['reason'].lower()})", "amount": w["cost"]})
+    feed.sort(key=lambda x: x["time"], reverse=True)
+
+    return jsonify({
+        "date": iso, "isToday": day == today_local(),
+        "sales": cur["sales"], "orders": cur["orders"], "average": round(cur["sales"] / cur["orders"]) if cur["orders"] else 0,
+        "purchases": cur["purchases"], "expenses": cur["expenses"], "wastage": wasted,
+        "net": cur["netProfit"], "yesterday": {"sales": before["sales"], "net": before["netProfit"]},
+        "counts": counts, "openNow": open_now,
+        "received": {**received, "total": received["cash"] + received["till"]},
+        "awaiting": {"count": waiting[0], "amount": int(waiting[1])},
+        "drafts": conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0],
+        "hourly": [hours[h] for h in range(24)],
+        "topDishes": sorted(dishes.values(), key=lambda x: (-x["qty"], x["name"]))[:5],
+        "team": sorted(team.values(), key=lambda x: -x["sales"]),
+        "purchasesList": [{"item": p["item"], "total": p["total"], "by": p["sname"]} for p in buys],
+        "expensesList": [{"category": e["category"], "description": e["description"], "amount": e["amount"], "by": e["sname"]} for e in spends],
+        "wastageList": [{"item": w["item"], "reason": w["reason"], "cost": w["cost"], "qty": w["qty"], "unit": w["unit"], "by": w["sname"]} for w in waste],
+        "feed": feed[:60],
     })
 
 
@@ -1445,7 +2133,7 @@ def list_purchases():
         "SELECT p.*, s.name AS by_name FROM purchases p LEFT JOIN staff s ON s.id=p.recorded_by "
         + where + "ORDER BY p.date DESC, p.id DESC", args).fetchall()
     return jsonify({"total": sum(r["total"] for r in rows), "rows": [
-        {"id": r["id"], "item": r["item"], "supplier": r["supplier"], "qty": r["qty"],
+        {"id": r["id"], "item": r["item"], "supplier": r["supplier"], "qty": r["qty"], "unit": r["unit"],
          "unitCost": r["unit_cost"], "total": r["total"], "date": r["date"], "recordedBy": r["by_name"]}
         for r in rows]})
 
@@ -1456,6 +2144,7 @@ def add_purchase():
     d = body()
     item = str(d.get("item", "")).strip()
     supplier = str(d.get("supplier", "")).strip()
+    unit = str(d.get("unit") or "").strip()
     qty = number(d.get("qty"), 0.01, 1_000_000)
     unit_cost = number(d.get("unit_cost"), 0, 10_000_000)
     day = parse_date(d.get("date")) if d.get("date") else today_local()
@@ -1463,6 +2152,8 @@ def add_purchase():
         return err("Please enter the item name.")
     if len(supplier) > 80:
         return err("Supplier name is too long.")
+    if len(unit) > 12:
+        return err("The unit is too long, e.g. kg, litres, bags.")
     if qty is None:
         return err("Enter a valid quantity.")
     if unit_cost is None:
@@ -1470,9 +2161,9 @@ def add_purchase():
     if day is None:
         return err("Enter a valid date.")
     cur = db().execute(
-        "INSERT INTO purchases (item, supplier, qty, unit_cost, total, date, recorded_by, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (item, supplier, qty, unit_cost, round(qty * unit_cost), day.isoformat(), g.user["id"], now()))
+        "INSERT INTO purchases (item, supplier, qty, unit_cost, total, date, recorded_by, created_at, unit) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (item, supplier, qty, unit_cost, round(qty * unit_cost), day.isoformat(), g.user["id"], now(), unit))
     db().commit()
     return jsonify({"ok": True, "id": cur.lastrowid}), 201
 
@@ -1497,7 +2188,58 @@ def list_expenses():
         + where + "ORDER BY e.date DESC, e.id DESC", args).fetchall()
     return jsonify({"total": sum(r["amount"] for r in rows), "categories": EXPENSE_CATEGORIES, "rows": [
         {"id": r["id"], "category": r["category"], "description": r["description"], "amount": r["amount"],
-         "date": r["date"], "recordedBy": r["by_name"]} for r in rows]})
+         "date": r["date"], "recordedBy": r["by_name"]} for r in rows],
+        "wastage": wastage_block(first)})
+
+
+def wastage_block(first):
+    """Food that was thrown away or lost, with what it cost. This money was already spent on purchases,
+    so it is shown beside the expenses and never added to them a second time."""
+    where, args = date_filter(first, "w.date")
+    rows = db().execute("SELECT w.*, s.name AS by_name FROM wastage w LEFT JOIN staff s ON s.id=w.recorded_by "
+                        + where + "ORDER BY w.date DESC, w.id DESC", args).fetchall()
+    reasons = {}
+    for r in rows:
+        reasons[r["reason"]] = reasons.get(r["reason"], 0) + r["cost"]
+    return {"total": sum(r["cost"] for r in rows), "count": len(rows), "reasons": WASTE_REASONS,
+            "byReason": sorted(({"reason": k, "amount": v} for k, v in reasons.items()), key=lambda x: -x["amount"]),
+            "rows": [{"id": r["id"], "item": r["item"], "qty": r["qty"], "unit": r["unit"], "cost": r["cost"],
+                      "reason": r["reason"], "date": r["date"], "recordedBy": r["by_name"]} for r in rows]}
+
+
+@app.post("/api/wastage")
+@require("staff", "expenses")
+def add_wastage():
+    d = body()
+    item = str(d.get("item", "")).strip()
+    unit = str(d.get("unit") or "").strip()
+    qty = number(d.get("qty"), 0.01, 1_000_000) if d.get("qty") not in (None, "") else None
+    cost = number(d.get("cost"), 1, 10_000_000)
+    day = parse_date(d.get("date")) if d.get("date") else today_local()
+    if not (1 <= len(item) <= 80):
+        return err("What food was wasted?")
+    if d.get("qty") not in (None, "") and qty is None:
+        return err("Enter a valid quantity, or leave it blank.")
+    if len(unit) > 12:
+        return err("The unit is too long, e.g. kg, plates.")
+    if cost is None:
+        return err("Enter what the wasted food cost, in KES.")
+    if d.get("reason") not in WASTE_REASONS:
+        return err("Choose a reason.")
+    if day is None:
+        return err("Enter a valid date.")
+    cur = db().execute("INSERT INTO wastage (item, qty, unit, cost, reason, date, recorded_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                       (item, qty, unit, round(cost), d["reason"], day.isoformat(), g.user["id"], now()))
+    db().commit()
+    return jsonify({"ok": True, "id": cur.lastrowid}), 201
+
+
+@app.delete("/api/wastage/<int:wid>")
+@require("staff", "expenses")
+def delete_wastage(wid):
+    cur = db().execute("DELETE FROM wastage WHERE id=?", (wid,))
+    db().commit()
+    return jsonify({"ok": True}) if cur.rowcount else err("Record not found.", 404)
 
 
 @app.post("/api/expenses")
@@ -1661,7 +2403,7 @@ def create_staff(argv):
 
 
 COPY_ORDER = ["staff", "customers", "menu", "combo_items", "orders", "order_items", "payments", "mpesa_receipts",
-              "purchases", "expenses", "price_changes", "staff_access", "settings"]
+              "purchases", "expenses", "drafts", "wastage", "feedback", "price_changes", "staff_access", "settings"]
 
 
 def migrate_to_postgres(argv):
