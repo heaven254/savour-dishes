@@ -14,7 +14,6 @@ import getpass
 import hashlib
 import hmac
 import json
-import math
 import os
 import re
 import secrets
@@ -22,6 +21,7 @@ import sqlite3
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -32,10 +32,11 @@ from werkzeug.security import check_password_hash, generate_password_hash
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("SD_DB", os.path.join(BASE_DIR, "saviour.db"))
 SESSION_HOURS = 12
+REMEMBER_DAYS = 30          # a 'remember me' session (staff are kept signed in this long)
 SERVICES = {"Dine in", "Room service", "Takeaway"}
 ROLES = {"Owner", "Staff"}
 # Dashboard areas. Owners can use all of them; staff can too unless the owner switches one off.
-AREAS = ["overview", "today", "orders", "sales", "purchases", "expenses", "transactions", "profit", "team", "menu", "customers", "feedback"]
+AREAS = ["overview", "today", "orders", "sales", "purchases", "expenses", "transactions", "profit", "team", "dishes", "menu"]
 PAYMENT_METHODS = ("KCB Till", "Cash")
 REF_RE = re.compile(r"^[A-Z0-9]{8,12}$")         # an M-Pesa confirmation code, e.g. SJK4H2XYZ1
 OWNER_ONLY = "owner"
@@ -147,7 +148,8 @@ CREATE TABLE IF NOT EXISTS purchases (
     item TEXT NOT NULL, supplier TEXT NOT NULL DEFAULT '',
     qty REAL NOT NULL, unit_cost REAL NOT NULL, total INTEGER NOT NULL,
     date TEXT NOT NULL, recorded_by INTEGER, created_at TEXT NOT NULL,
-    unit TEXT NOT NULL DEFAULT ''
+    unit TEXT NOT NULL DEFAULT '',
+    trip_id INTEGER, trip_label TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS expenses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,6 +190,11 @@ CREATE TABLE IF NOT EXISTS drafts (
     items TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
     created_by INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS purchase_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL DEFAULT '', date TEXT NOT NULL, lines TEXT NOT NULL,
+    created_by INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id),
@@ -198,6 +205,11 @@ CREATE TABLE IF NOT EXISTS wastage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     item TEXT NOT NULL, qty REAL, unit TEXT NOT NULL DEFAULT '', cost INTEGER NOT NULL,
     reason TEXT NOT NULL, date TEXT NOT NULL, recorded_by INTEGER, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS record_photos (
+    kind TEXT NOT NULL, record_id INTEGER NOT NULL, mime TEXT NOT NULL, data TEXT NOT NULL,
+    added_by INTEGER, created_at TEXT NOT NULL,
+    PRIMARY KEY (kind, record_id)
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (
@@ -220,7 +232,7 @@ if USE_PG:
     IntegrityError = (sqlite3.IntegrityError, psycopg.errors.IntegrityError)
 else:
     IntegrityError = (sqlite3.IntegrityError,)
-HAS_ID = {"customers", "staff", "menu", "orders", "order_items", "purchases", "expenses", "price_changes", "payments", "drafts", "wastage", "feedback"}
+HAS_ID = {"customers", "staff", "menu", "orders", "order_items", "purchases", "expenses", "price_changes", "payments", "drafts", "purchase_drafts", "wastage", "feedback"}
 _pool = None
 
 
@@ -379,7 +391,7 @@ def normalize_phone(raw):
 def migrate_customers(conn):
     """Customers used to sign in with email + password. They now use their phone number only."""
     cols = conn.columns("customers")
-    if "email" not in cols and "password_hash" not in cols:
+    if "email" not in cols:
         return
     conn.execute("DROP TABLE IF EXISTS customers_new")
     conn.execute("""CREATE TABLE customers_new (
@@ -414,6 +426,10 @@ def init_db():
                      ("geo_lat", "REAL"), ("geo_lng", "REAL"), ("geo_acc", "REAL")):
         if col not in have:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
+    have = conn.columns("customers")
+    for col, typ in (("password_hash", "TEXT"), ("phone_verified", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in have:
+            conn.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
     have = conn.columns("payments")
     for col, typ in (("checkout_id", "TEXT"), ("note", "TEXT"), ("auto", "INTEGER NOT NULL DEFAULT 0")):
         if col not in have:
@@ -439,7 +455,9 @@ def init_db():
     for table, col, typ in (("menu", "is_combo", "INTEGER NOT NULL DEFAULT 0"),
                             ("order_items", "detail", "TEXT NOT NULL DEFAULT ''"),
                             ("combo_items", "pos", "INTEGER NOT NULL DEFAULT 0"),
-                            ("purchases", "unit", "TEXT NOT NULL DEFAULT ''")):
+                            ("purchases", "unit", "TEXT NOT NULL DEFAULT ''"),
+                            ("purchases", "trip_id", "INTEGER"),
+                            ("purchases", "trip_label", "TEXT NOT NULL DEFAULT ''")):
         have = conn.columns(table)
         if col not in have:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
@@ -468,6 +486,7 @@ def init_db():
         if default:
             print("WARNING: created staff01 with the DEFAULT password 'saviour123'.\n"
                   "         Set SD_ADMIN_PASSWORD before first run, or change it before going live.")
+    conn.execute("DELETE FROM sessions WHERE user_type<>'staff'")      # the customer side is gone: end any old customer sign-ins
     conn.commit()
     release(conn)
 
@@ -490,9 +509,10 @@ def sha(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def new_session(user_type, user_id):
+def new_session(user_type, user_id, remember=False):
     token = secrets.token_urlsafe(32)
-    expires = (datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hours = REMEMBER_DAYS * 24 if remember else SESSION_HOURS
+    expires = (datetime.now(timezone.utc) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
     db().execute("DELETE FROM sessions WHERE expires_at < ?", (now(),))
     db().execute("INSERT INTO sessions VALUES (?,?,?,?)", (sha(token), user_type, user_id, expires))
     db().commit()
@@ -541,12 +561,6 @@ def require(kind, area=None):
             return fn(*args, **kwargs)
         return wrapper
     return deco
-
-
-def customer_json(c):
-    # A customer's saved coordinates are never sent back to the browser: only whether a location is shared.
-    return {"type": "customer", "name": c["name"], "phone": c["phone"],
-            "locationShared": c["lat"] is not None, "locationAt": c["location_at"]}
 
 
 def staff_json(s):
@@ -600,10 +614,10 @@ def orders_json(rows, geo=False):
     pays = pay_rows_for([o["id"] for o in rows])
     fbs = feedback_for([o["id"] for o in rows])
     for o in rows:
-        items = db().execute("SELECT name, qty, detail FROM order_items WHERE order_id=?", (o["id"],)).fetchall()
+        items = db().execute("SELECT menu_id, name, qty, detail FROM order_items WHERE order_id=?", (o["id"],)).fetchall()
         row = {
             "id": f"SD{o['id']:04d}", "customerName": o["cname"], "phone": o["phone"],
-            "items": [{"name": i["name"], "qty": i["qty"], "detail": i["detail"]} for i in items],
+            "items": [{"menuId": i["menu_id"], "name": i["name"], "qty": i["qty"], "detail": i["detail"]} for i in items],
             "total": o["total"], "service": o["service"], "location": o["location"],
             "status": o["status"], "time": o["created_at"],
             "startedBy": o["started_name"], "servedBy": o["served_name"], "servedAt": o["served_at"],
@@ -631,71 +645,7 @@ ORDER_SELECT = ("SELECT o.*, c.name AS cname, c.phone AS phone, "
                 "LEFT JOIN staff s1 ON s1.id=o.started_by "
                 "LEFT JOIN staff s2 ON s2.id=o.served_by ")
 
-def parse_geo(v):
-    """An optional location from the browser: {lat, lng, accuracy?}.
-    Returns ((lat, lng, accuracy), None); ((None, None, None), None) when none was sent;
-    or (None, error_response) when it is not a real location."""
-    if v is None:
-        return (None, None, None), None
-
-    def num(x):
-        return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
-
-    bad = err("That location doesn't look right. Please try sharing it again.")
-    if not isinstance(v, dict) or not num(v.get("lat")) or not num(v.get("lng")):
-        return None, bad
-    if not (-90 <= v["lat"] <= 90 and -180 <= v["lng"] <= 180):
-        return None, bad
-    acc = v.get("accuracy")
-    if acc is not None and not (num(acc) and 0 <= acc <= 1_000_000):
-        return None, bad
-    return (round(float(v["lat"]), 6), round(float(v["lng"]), 6), None if acc is None else round(float(acc))), None
-
-
-# ---------- auth routes ----------
-PHONE_HELP = "Enter a valid phone number, for example 0712 345 678."
-
-
-@app.post("/api/register")
-def register():
-    """Sign up with a phone number only (name and location are optional)."""
-    d = body()
-    phone = normalize_phone(d.get("phone"))
-    name = str(d.get("name", "")).strip()
-    if not phone:
-        return err(PHONE_HELP)
-    if len(name) > 80:
-        return err("That name is too long.")
-    geo, e = parse_geo(d.get("location"))
-    if e:
-        return e
-    name = name or f"Customer {phone[-4:]}"
-    try:
-        cur = db().execute(
-            "INSERT INTO customers (name, phone, created_at, lat, lng, accuracy, location_at) VALUES (?,?,?,?,?,?,?)",
-            (name, phone, now(), *geo, now() if geo[0] is not None else None))
-        db().commit()
-    except IntegrityError:
-        return err("This number already has an account. Please log in instead.", 409)
-    c = db().execute("SELECT * FROM customers WHERE id=?", (cur.lastrowid,)).fetchone()
-    return jsonify({"token": new_session("customer", c["id"]), "user": customer_json(c)}), 201
-
-
-@app.post("/api/login/customer")
-def login_customer():
-    """Log in with a phone number only."""
-    if too_many_attempts():
-        return err("Too many failed attempts. Try again in a few minutes.", 429)
-    phone = normalize_phone(body().get("phone"))
-    if not phone:
-        return err(PHONE_HELP)
-    c = db().execute("SELECT * FROM customers WHERE phone=?", (phone,)).fetchone()
-    if not c:
-        note_failure()
-        return err("No account found for that number. Please sign up first.", 404)
-    return jsonify({"token": new_session("customer", c["id"]), "user": customer_json(c)})
-
-
+# ---------- sign-in ----------
 @app.post("/api/login/staff")
 def login_staff():
     if too_many_attempts():
@@ -726,33 +676,10 @@ def me():
                        (sha(header[7:]), now())).fetchone()
     if not row:
         return err("Session expired. Please log in again.", 401)
-    if row["user_type"] == "customer":
-        c = db().execute("SELECT * FROM customers WHERE id=?", (row["user_id"],)).fetchone()
-        return jsonify({"user": customer_json(c)}) if c else err("Please log in.", 401)
+    if row["user_type"] != "staff":
+        return err("Please log in.", 401)
     s = db().execute("SELECT * FROM staff WHERE id=?", (row["user_id"],)).fetchone()
     return jsonify({"user": staff_json(s)}) if s else err("Please log in.", 401)
-
-
-# ---------- customer location (optional, set by the customer) ----------
-@app.put("/api/me/location")
-@require("customer")
-def save_my_location():
-    geo, e = parse_geo(body())
-    if e:
-        return e
-    db().execute("UPDATE customers SET lat=?, lng=?, accuracy=?, location_at=? WHERE id=?",
-                 (*geo, now(), g.user["id"]))
-    db().commit()
-    return jsonify({"ok": True})
-
-
-@app.delete("/api/me/location")
-@require("customer")
-def remove_my_location():
-    db().execute("UPDATE customers SET lat=NULL, lng=NULL, accuracy=NULL, location_at=NULL WHERE id=?",
-                 (g.user["id"],))
-    db().commit()
-    return jsonify({"ok": True})
 
 
 # ---------- menu, prices & combos ----------
@@ -1020,88 +947,43 @@ def delete_combo(combo_id):
 
 
 # ---------- orders ----------
-@app.post("/api/orders")
-@require("customer")
-def place_order():
-    d = body()
-    service = d.get("service")
-    location = str(d.get("location", "")).strip()
-    items = d.get("items")
-    if service not in SERVICES:
-        return err("Choose dine in, room service or takeaway.")
-    if not (1 <= len(location) <= 40):
-        return err("Please enter your table or room number.")
-    if not isinstance(items, list) or not (1 <= len(items) <= 30):
-        return err("Your order is empty.")
-    geo, e = parse_geo(d.get("geo"))        # optional: where to find the customer
-    if e:
-        return e
-    pay = d.get("payment", {"method": "Cash"})      # no choice sent = pay cash
-    if not isinstance(pay, dict) or pay.get("method") not in PAYMENT_METHODS + ("Split",):
-        return err("Choose how you will pay: KCB Till, Cash or both.")
-    ref = None
-    if pay["method"] in ("KCB Till", "Split") and str(pay.get("reference") or "").strip():
-        ref, e = clean_ref(pay.get("reference"))
-        if e:
-            return e
-
-    # Prices and availability always come from the database, never the browser.
-    wanted = {}
-    for it in items:
-        if not isinstance(it, dict) or not isinstance(it.get("id"), int) or not isinstance(it.get("qty"), int):
-            return err("Invalid order items.")
-        if not (1 <= it["qty"] <= 50):
-            return err("Quantity must be between 1 and 50.")
-        wanted[it["id"]] = wanted.get(it["id"], 0) + it["qty"]
-
-    menu = {m["id"]: m for m in load_menu()}
-    lines, total = [], 0
-    for menu_id, qty in wanted.items():
-        m = menu.get(menu_id)
-        if not m:
-            return err("A dish in your order does not exist.")
-        if not m["available"]:
-            return err(f"Sorry, {m['name']} is currently unavailable.", 409)
-        detail = ", ".join(f"{i['qty']}× {i['name']}" for i in m["items"]) if m["combo"] else ""
-        lines.append((m["id"], m["name"], m["price"], qty, detail))
-        total += m["price"] * qty
-    shown = d.get("total")      # the total the customer saw; if prices changed meanwhile, ask them to check
-    if isinstance(shown, int) and not isinstance(shown, bool) and shown != total:
-        return err("Some prices have changed. Please check your order total and place it again.", 409)
-
-    if pay["method"] == "Split":        # part in cash, the rest by till
-        cash = pay.get("cash")
-        if isinstance(cash, bool) or not isinstance(cash, (int, float)) or not (1 <= cash < total):
-            return err("For a split payment, enter how much you will pay in cash. It must be less than the total.")
-        cash = int(round(cash))
-        pay_rows = [("Cash", cash, None), ("KCB Till", total - cash, ref)]
-    else:
-        pay_rows = [(pay["method"], total, ref)]
-    conn = db()
-    if ref and ref_in_use(ref):
-        return err("That M-Pesa code has already been used for another payment.", 409)
-    cur = conn.execute(
-        "INSERT INTO orders (customer_id, service, location, total, created_at, geo_lat, geo_lng, geo_acc) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (g.user["id"], service, location, total, now(), *geo),
-    )
-    order_id = cur.lastrowid
-    conn.executemany(
-        "INSERT INTO order_items (order_id, menu_id, name, price, qty, detail) VALUES (?,?,?,?,?,?)",
-        [(order_id, *line) for line in lines],
-    )
-    for method, amount, reference in pay_rows:
-        conn.execute("INSERT INTO payments (order_id, method, amount, reference, created_at) VALUES (?,?,?,?,?)",
-                     (order_id, method, amount, reference, now()))
-    conn.commit()
-    return jsonify({"ok": True, "id": f"SD{order_id:04d}", "total": total, "payment": pay["method"]}), 201
+def receipt_data(order_id, staff_view):
+    """Everything printed on a receipt, or (None, error response)."""
+    o = db().execute(ORDER_SELECT + "WHERE o.id=?", (order_id,)).fetchone()
+    if not o:
+        return None, err("Order not found.", 404)
+    if o["status"] == "Cancelled":
+        return None, err("This order was cancelled, so it has no receipt.", 409)
+    lines = db().execute("SELECT name, price, qty, detail FROM order_items WHERE order_id=? ORDER BY id", (order_id,)).fetchall()
+    pay = pay_summary(pay_rows_for([order_id]).get(order_id))
+    walkin = o["phone"] == "walk-in"
+    return {
+        "business": "Savour Dishes", "tagline": "Delight in every bite",
+        "id": f"SD{order_id:04d}", "time": o["created_at"], "status": o["status"],
+        "servedAt": o["served_at"], "servedBy": o["served_name"],
+        "customer": "Walk-in customer" if walkin else o["cname"],
+        "phone": None if walkin else o["phone"],
+        "service": o["service"], "location": o["location"],
+        "items": [{"name": i["name"], "qty": i["qty"], "price": i["price"], "total": i["qty"] * i["price"],
+                   "detail": i["detail"]} for i in lines],
+        "total": o["total"], "payment": pay,
+    }, None
 
 
-@app.get("/api/orders/mine")
-@require("customer")
-def my_orders():
-    rows = db().execute(ORDER_SELECT + "WHERE o.customer_id=? ORDER BY o.id DESC", (g.user["id"],)).fetchall()
-    return jsonify(orders_json(rows))
+@app.get("/api/receipts/<code>")
+def staff_receipt(code):
+    return _staff_receipt(code)
+
+
+@require("staff")
+def _staff_receipt(code):
+    if not any(can_access(g.user, a) for a in ("orders", "sales", "transactions")):
+        return err("You do not have access to this.", 403)
+    m = re.fullmatch(r"SD(\d{1,9})", code)
+    if not m:
+        return err("Order not found.", 404)
+    data, e = receipt_data(int(m.group(1)), True)
+    return e or jsonify(data)
 
 
 @app.get("/api/orders")
@@ -1134,58 +1016,6 @@ def update_order(code):
 
 
 # ---------- customer feedback ----------
-@app.post("/api/orders/<code>/feedback")
-@require("customer")
-def give_feedback(code):
-    """Optional: a star rating (1-5) and/or a few words about a served order. Can be changed later."""
-    m = re.fullmatch(r"SD(\d{1,9})", code)
-    o = m and db().execute("SELECT * FROM orders WHERE id=? AND customer_id=?", (int(m.group(1)), g.user["id"])).fetchone()
-    if not o:
-        return err("Order not found.", 404)
-    if o["status"] != "Served":
-        return err("You can rate an order once it has been served.", 409)
-    d = body()
-    rating = d.get("rating")
-    if rating in (None, ""):
-        rating = None
-    elif type(rating) is not int or not (1 <= rating <= 5):
-        return err("Choose between 1 and 5 stars.")
-    comment = str(d.get("comment") or "").strip()
-    if len(comment) > 500:
-        return err("Please keep your comment under 500 characters.")
-    if rating is None and not comment:
-        return err("Choose a star rating or write a few words.")
-    t = now()
-    if db().execute("SELECT id FROM feedback WHERE order_id=?", (o["id"],)).fetchone():
-        db().execute("UPDATE feedback SET rating=?, comment=?, updated_at=? WHERE order_id=?", (rating, comment, t, o["id"]))
-    else:
-        db().execute("INSERT INTO feedback (order_id, customer_id, rating, comment, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                     (o["id"], g.user["id"], rating, comment, t, t))
-    db().commit()
-    return jsonify({"ok": True})
-
-
-@app.get("/api/feedback")
-@require("staff", "feedback")
-def list_feedback():
-    name, first = get_range()
-    if name is None:
-        return err("Invalid period.")
-    rows = db().execute("SELECT f.*, c.name AS cname FROM feedback f JOIN customers c ON c.id=f.customer_id "
-                        "ORDER BY f.updated_at DESC").fetchall()
-    rows = [r for r in rows if in_range(local_date(r["updated_at"]), first)]
-    rated = [r["rating"] for r in rows if r["rating"]]
-    dist = {str(n): rated.count(n) for n in range(1, 6)}
-    out = []
-    for r in rows:
-        its = db().execute("SELECT name, qty FROM order_items WHERE order_id=?", (r["order_id"],)).fetchall()
-        out.append({"order": f"SD{r['order_id']:04d}", "customer": r["cname"], "rating": r["rating"], "comment": r["comment"],
-                    "items": ", ".join(f"{i['qty']}× {i['name']}" for i in its), "time": r["updated_at"]})
-    return jsonify({"count": len(rows), "rated": len(rated), "average": round(sum(rated) / len(rated), 1) if rated else None,
-                    "happy": round(sum(1 for x in rated if x >= 4) / len(rated) * 100) if rated else None,
-                    "distribution": dist, "rows": out})
-
-
 # ---------- payments: KCB Till or cash ----------
 def clean_ref(raw):
     """Returns (code, None) or (None, error_response) for an M-Pesa confirmation code."""
@@ -1227,29 +1057,6 @@ def set_till():
     return jsonify({"ok": True, "till": till_number()})
 
 
-@app.post("/api/orders/<code>/payment-ref")
-@require("customer")
-def add_payment_ref(code):
-    """The customer enters the M-Pesa code after paying to the till."""
-    m = re.fullmatch(r"SD(\d{1,9})", code)
-    p = m and db().execute("SELECT p.* FROM payments p JOIN orders o ON o.id=p.order_id "
-                           "WHERE o.id=? AND o.customer_id=? AND p.method='KCB Till' ORDER BY p.id LIMIT 1",
-                           (int(m.group(1)), g.user["id"])).fetchone()
-    if not p:
-        return err("Order not found.", 404)
-    if p["status"] == "Paid":
-        return err("This payment can't be changed.", 409)
-    ref, e = clean_ref(body().get("reference"))
-    if e:
-        return e
-    if ref_in_use(ref, p["id"]):
-        return err("That M-Pesa code has already been used for another payment.", 409)
-    db().execute("UPDATE payments SET reference=?, status='Pending' WHERE id=?", (ref, p["id"]))
-    db().commit()
-    paid = try_auto_confirm(p["id"])        # the money may already have been reported by Safaricom
-    return jsonify({"ok": True, "paid": paid})
-
-
 # ---------- automatic M-Pesa confirmation (Safaricom Daraja) ----------
 # Off until these are set. See README. Staff can always confirm by hand instead.
 MPESA = {k: os.environ.get(v, "") for k, v in (
@@ -1263,8 +1070,8 @@ _last_push = {}
 
 
 def mpesa_enabled():
-    """Prompts on the customer's phone are possible."""
-    return all(MPESA[k] for k in ("key", "secret", "shortcode", "passkey", "public")) and MPESA["public"].startswith("https://")
+    """Till notifications from Safaricom can be received and matched to payments."""
+    return all(MPESA[k] for k in ("key", "secret", "shortcode", "public")) and MPESA["public"].startswith("https://")
 
 
 def callback_secret():
@@ -1355,75 +1162,8 @@ def mpesa_status():
                     "urls": mpesa_urls() if MPESA["public"].startswith("https://") else None})
 
 
-@app.post("/api/orders/<code>/stk-push")
-@require("customer")
-def stk_push(code):
-    """Sends the M-Pesa payment prompt to the customer's phone."""
-    if not mpesa_enabled():
-        return err("Automatic M-Pesa isn't set up yet. Pay to the till and enter your code.", 503)
-    m = re.fullmatch(r"SD(\d{1,9})", code)
-    p = m and db().execute("SELECT p.* FROM payments p JOIN orders o ON o.id=p.order_id "
-                           "WHERE o.id=? AND o.customer_id=? AND p.method='KCB Till' ORDER BY p.id LIMIT 1",
-                           (int(m.group(1)), g.user["id"])).fetchone()
-    if not p:
-        return err("Order not found.", 404)
-    if p["status"] == "Paid":
-        return err("This order doesn't need a payment prompt.", 409)
-    phone = normalize_phone(body().get("phone") or g.user["phone"])
-    if not phone or not re.fullmatch(r"\+254[17]\d{8}", phone):
-        return err("Enter a Kenyan M-Pesa number, like 0712 345 678.")
-    if time.time() - _last_push.get(p["id"], 0) < 30:
-        return err("A prompt was just sent. Please wait a few seconds, check your phone, then try again.", 429)
-    stamp = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y%m%d%H%M%S")      # Safaricom clocks are EAT
-    till = MPESA["till"] or MPESA["shortcode"]
-    payload = {
-        "BusinessShortCode": MPESA["shortcode"],
-        "Password": base64.b64encode((MPESA["shortcode"] + MPESA["passkey"] + stamp).encode()).decode(),
-        "Timestamp": stamp,
-        "TransactionType": "CustomerPayBillOnline" if MPESA_PAYBILL else "CustomerBuyGoodsOnline",
-        "Amount": int(p["amount"]), "PartyA": phone[1:], "PartyB": till, "PhoneNumber": phone[1:],
-        "CallBackURL": mpesa_urls()["stk"], "AccountReference": f"SD{p['order_id']:04d}",
-        "TransactionDesc": "Savour Dishes",
-    }
-    try:
-        r = mpesa_call("/mpesa/stkpush/v1/processrequest", payload)
-    except RuntimeError as e:
-        return err(str(e), 502)
-    if str(r.get("ResponseCode")) != "0" or not r.get("CheckoutRequestID"):
-        return err(r.get("errorMessage") or r.get("ResponseDescription") or "M-Pesa could not send the prompt.", 502)
-    _last_push[p["id"]] = time.time()
-    db().execute("UPDATE payments SET checkout_id=?, note=NULL WHERE id=?", (r["CheckoutRequestID"], p["id"]))
-    db().commit()
-    return jsonify({"ok": True, "message": "Check your phone and enter your M-Pesa PIN."})
-
-
 def _secret_ok(token):
     return hmac.compare_digest(str(token), callback_secret())
-
-
-@app.post("/api/pay/stk/<token>")
-def stk_callback(token):
-    """Safaricom reports what happened to a payment prompt."""
-    if not _secret_ok(token):
-        return err("Not found.", 404)
-    cb = ((body().get("Body") or {}).get("stkCallback")) or {}
-    p = db().execute("SELECT * FROM payments WHERE checkout_id=?", (str(cb.get("CheckoutRequestID", "")),)).fetchone()
-    if p and p["status"] != "Paid":
-        if cb.get("ResultCode") == 0:
-            meta = {i.get("Name"): i.get("Value") for i in (cb.get("CallbackMetadata") or {}).get("Item", [])
-                    if isinstance(i, dict)}
-            receipt = str(meta.get("MpesaReceiptNumber") or "").upper()
-            if REF_RE.match(receipt) and isinstance(meta.get("Amount"), (int, float)):
-                record_receipt(receipt, meta["Amount"], str(meta.get("PhoneNumber") or ""), "prompt")
-                if not ref_in_use(receipt, p["id"]):
-                    db().execute("UPDATE payments SET reference=? WHERE id=?", (receipt, p["id"]))
-                    db().commit()
-                    try_auto_confirm(p["id"])
-        else:   # cancelled, timed out, wrong PIN, not enough money...
-            db().execute("UPDATE payments SET note=? WHERE id=?",
-                         (str(cb.get("ResultDesc") or "The M-Pesa payment was not completed.")[:160], p["id"]))
-            db().commit()
-    return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
 
 
 @app.post("/api/pay/c2b/<token>/validation")
@@ -1715,12 +1455,12 @@ def new_sale():
     wanted, e = clean_lines(d.get("items"))
     if e:
         return e
-    service = d.get("service") or "Takeaway"
-    location = str(d.get("location") or "").strip() or "Counter"
+    service = d.get("service") or "Dine in"
+    location = str(d.get("location") or "").strip()
     if service not in SERVICES:
-        return err("Choose dine in, room service or takeaway.")
+        return err("Unknown service.")
     if len(location) > 40:
-        return err("The table or room is too long.")
+        return err("That is too long.")
     menu = {m["id"]: m for m in load_menu()}
     lines, total = [], 0
     for menu_id, qty in wanted.items():
@@ -1755,16 +1495,6 @@ def new_sale():
 
 
 # ---------- customers (staff only) ----------
-@app.get("/api/customers")
-@require("staff", "customers")
-def list_customers():
-    rows = db().execute("SELECT * FROM customers WHERE phone != 'walk-in' ORDER BY id DESC").fetchall()
-    return jsonify([{"name": r["name"], "phone": r["phone"], "joined": r["created_at"],
-                     "location": {"lat": r["lat"], "lng": r["lng"], "accuracy": r["accuracy"], "time": r["location_at"]}
-                                 if r["lat"] is not None else None}
-                    for r in rows])
-
-
 # ---------- business records & reports (managers only) ----------
 TZ_OFFSET = timedelta(hours=float(os.environ.get("SD_TZ_HOURS", "3")))  # default: East Africa Time
 EXPENSE_CATEGORIES = ["Rent", "Salaries", "Utilities", "Transport", "Repairs", "Marketing", "Other"]
@@ -1830,7 +1560,7 @@ def report_overview():
     total_purchases = sum(p["total"] for p in purchases)
     total_expenses = sum(e["amount"] for e in expenses)
 
-    counts = {"total": 0, "pending": 0, "preparing": 0, "served": 0}
+    counts = {"total": 0, "pending": 0, "preparing": 0, "served": 0, "cancelled": 0}
     for o in db().execute("SELECT status, created_at FROM orders"):
         if in_range(local_date(o["created_at"]), first):
             counts["total"] += 1
@@ -2035,7 +1765,7 @@ def report_today():
                "ORDER BY at DESC", lo, hi)
     placed = q("SELECT o.id, o.total, o.status, o.created_at, c.name AS cname, c.phone AS phone FROM orders o "
                "JOIN customers c ON c.id=o.customer_id WHERE o.created_at >= ? AND o.created_at < ? ORDER BY o.id DESC", lo, hi)
-    counts = {"placed": len(placed), "pending": 0, "preparing": 0, "served": 0}
+    counts = {"placed": len(placed), "pending": 0, "preparing": 0, "served": 0, "cancelled": 0}
     for o in placed:
         counts[o["status"].lower()] += 1
     open_now = conn.execute("SELECT COUNT(*) FROM orders WHERE status IN ('Pending','Preparing')").fetchone()[0]
@@ -2132,46 +1862,202 @@ def list_purchases():
     rows = db().execute(
         "SELECT p.*, s.name AS by_name FROM purchases p LEFT JOIN staff s ON s.id=p.recorded_by "
         + where + "ORDER BY p.date DESC, p.id DESC", args).fetchall()
-    return jsonify({"total": sum(r["total"] for r in rows), "rows": [
-        {"id": r["id"], "item": r["item"], "supplier": r["supplier"], "qty": r["qty"], "unit": r["unit"],
-         "unitCost": r["unit_cost"], "total": r["total"], "date": r["date"], "recordedBy": r["by_name"]}
-        for r in rows]})
+    have = photo_ids("purchases")
+    out, trips = [], {}
+    for r in rows:
+        line = {"id": r["id"], "item": r["item"], "supplier": r["supplier"], "qty": r["qty"], "unit": r["unit"],
+                "unitCost": r["unit_cost"], "total": r["total"], "date": r["date"], "recordedBy": r["by_name"]}
+        if r["trip_id"] is None:
+            line["hasPhoto"] = r["id"] in have
+            out.append(line)
+        elif r["trip_id"] in trips:                 # the rest of a trip bought together: one line in the list
+            t = trips[r["trip_id"]]
+            t["items"].append(line); t["total"] += r["total"]
+        else:
+            t = {"id": r["trip_id"], "trip": True, "label": r["trip_label"], "date": r["date"], "total": r["total"],
+                 "recordedBy": r["by_name"], "hasPhoto": r["trip_id"] in have, "items": [line]}
+            trips[r["trip_id"]] = t
+            out.append(t)
+    for t in trips.values():
+        t["items"].sort(key=lambda x: x["id"])
+        t["count"] = len(t["items"])
+    return jsonify({"total": sum(r["total"] for r in rows), "rows": out})
+
+
+def purchase_line(d):
+    """One purchase line, validated: ({item, supplier, unit, qty, unit_cost}, None) or (None, error response)."""
+    item = str(d.get("item", "")).strip()
+    supplier = str(d.get("supplier", "")).strip()
+    unit = str(d.get("unit") or "").strip()
+    qty = number(d.get("qty"), 0.01, 1_000_000)
+    unit_cost = number(d.get("unit_cost"), 0, 10_000_000)
+    if not (1 <= len(item) <= 80):
+        return None, err("Please enter the item name.")
+    if len(supplier) > 80:
+        return None, err("Supplier name is too long.")
+    if len(unit) > 12:
+        return None, err("The unit is too long, e.g. kg, litres, bags.")
+    if qty is None:
+        return None, err("Enter a valid quantity.")
+    if unit_cost is None:
+        return None, err("Enter a valid unit cost.")
+    return {"item": item, "supplier": supplier, "unit": unit, "qty": qty, "unit_cost": unit_cost}, None
+
+
+def insert_purchase(conn, line, day, trip_id=None, trip_label=""):
+    cur = conn.execute(
+        "INSERT INTO purchases (item, supplier, qty, unit_cost, total, date, recorded_by, created_at, unit, trip_id, trip_label) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (line["item"], line["supplier"], line["qty"], line["unit_cost"], round(line["qty"] * line["unit_cost"]),
+         day.isoformat(), g.user["id"], now(), line["unit"], trip_id, trip_label))
+    return cur.lastrowid
 
 
 @app.post("/api/purchases")
 @require("staff", "purchases")
 def add_purchase():
     d = body()
-    item = str(d.get("item", "")).strip()
-    supplier = str(d.get("supplier", "")).strip()
-    unit = str(d.get("unit") or "").strip()
-    qty = number(d.get("qty"), 0.01, 1_000_000)
-    unit_cost = number(d.get("unit_cost"), 0, 10_000_000)
+    line, e = purchase_line(d)
+    if e:
+        return e
     day = parse_date(d.get("date")) if d.get("date") else today_local()
-    if not (1 <= len(item) <= 80):
-        return err("Please enter the item name.")
-    if len(supplier) > 80:
-        return err("Supplier name is too long.")
-    if len(unit) > 12:
-        return err("The unit is too long, e.g. kg, litres, bags.")
-    if qty is None:
-        return err("Enter a valid quantity.")
-    if unit_cost is None:
-        return err("Enter a valid unit cost.")
     if day is None:
         return err("Enter a valid date.")
-    cur = db().execute(
-        "INSERT INTO purchases (item, supplier, qty, unit_cost, total, date, recorded_by, created_at, unit) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (item, supplier, qty, unit_cost, round(qty * unit_cost), day.isoformat(), g.user["id"], now(), unit))
+    pid = insert_purchase(db(), line, day)
+    db().commit()
+    return jsonify({"ok": True, "id": pid}), 201
+
+
+# ---------- purchase drafts: a shopping list that is saved first and recorded as purchases when submitted ----------
+MAX_DRAFT_LINES = 60
+
+
+def purchase_draft_fields(d):
+    """(label, date, lines_json) validated, or (None, error). Lines are stored as the browser will show them."""
+    label = str(d.get("label") or "").strip()
+    if len(label) > 40:
+        return None, err("The name is too long.")
+    day = parse_date(d.get("date")) if d.get("date") else today_local()
+    if day is None:
+        return None, err("Enter a valid date.")
+    raw = d.get("lines")
+    if not isinstance(raw, list) or not raw:
+        return None, err("Add at least one item to the list.")
+    if len(raw) > MAX_DRAFT_LINES:
+        return None, err(f"A list can have at most {MAX_DRAFT_LINES} items.")
+    lines = []
+    for r in raw:
+        line, e = purchase_line(r if isinstance(r, dict) else {})
+        if e:
+            return None, e
+        lines.append(line)
+    return (label, day.isoformat(), json.dumps(lines)), None
+
+
+def purchase_draft_json(r):
+    lines = [dict(l, total=round(l["qty"] * l["unit_cost"])) for l in json.loads(r["lines"])]
+    return {"id": r["id"], "label": r["label"], "date": r["date"], "lines": lines, "count": len(lines),
+            "total": sum(l["total"] for l in lines), "by": r["by_name"], "updated": r["updated_at"],
+            "hasPhoto": r["id"] in photo_ids("purchase_drafts")}
+
+
+@app.get("/api/purchase-drafts")
+@require("staff", "purchases")
+def list_purchase_drafts():
+    rows = db().execute("SELECT d.*, s.name AS by_name FROM purchase_drafts d LEFT JOIN staff s ON s.id=d.created_by "
+                        "ORDER BY d.updated_at DESC, d.id DESC").fetchall()
+    return jsonify([purchase_draft_json(r) for r in rows])
+
+
+@app.post("/api/purchase-drafts")
+@require("staff", "purchases")
+def add_purchase_draft():
+    f, e = purchase_draft_fields(body())
+    if e:
+        return e
+    t = now()
+    cur = db().execute("INSERT INTO purchase_drafts (label, date, lines, created_by, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                       (*f, g.user["id"], t, t))
     db().commit()
     return jsonify({"ok": True, "id": cur.lastrowid}), 201
+
+
+@app.put("/api/purchase-drafts/<int:did>")
+@require("staff", "purchases")
+def update_purchase_draft(did):
+    f, e = purchase_draft_fields(body())
+    if e:
+        return e
+    cur = db().execute("UPDATE purchase_drafts SET label=?, date=?, lines=?, updated_at=? WHERE id=?", (*f, now(), did))
+    db().commit()
+    return jsonify({"ok": True, "id": did}) if cur.rowcount else err("Draft not found.", 404)
+
+
+@app.delete("/api/purchase-drafts/<int:did>")
+@require("staff", "purchases")
+def delete_purchase_draft(did):
+    cur = db().execute("DELETE FROM purchase_drafts WHERE id=?", (did,))
+    db().execute("DELETE FROM record_photos WHERE kind='purchase_drafts' AND record_id=?", (did,))
+    db().commit()
+    return jsonify({"ok": True}) if cur.rowcount else err("Draft not found.", 404)
+
+
+@app.post("/api/purchase-drafts/<int:did>/submit")
+@require("staff", "purchases")
+def submit_purchase_draft(did):
+    """Records every line as a purchase (all or nothing) and removes the draft."""
+    conn = db()
+    row = conn.execute("SELECT * FROM purchase_drafts WHERE id=?", (did,)).fetchone()
+    if not row:
+        return err("Draft not found. It may already have been submitted.", 404)
+    day = parse_date(row["date"]) or today_local()
+    ids, total = [], 0
+    try:
+        lines = json.loads(row["lines"])
+        if len(lines) == 1:
+            ids.append(insert_purchase(conn, lines[0], day))        # one item is just a normal purchase
+            head = ids[0]
+        else:
+            # several items bought together: they share a trip id (the first line's id) and show as one line
+            head = insert_purchase(conn, lines[0], day, None, row["label"])
+            conn.execute("UPDATE purchases SET trip_id=? WHERE id=?", (head, head))
+            ids.append(head)
+            for l in lines[1:]:
+                ids.append(insert_purchase(conn, l, day, head, row["label"]))
+        total = sum(round(l["qty"] * l["unit_cost"]) for l in lines)
+        photo = conn.execute("SELECT mime, data, added_by, created_at FROM record_photos WHERE kind='purchase_drafts' AND record_id=?", (did,)).fetchone()
+        if photo:                                                   # the receipt goes with the trip
+            conn.execute("DELETE FROM record_photos WHERE kind='purchases' AND record_id=?", (head,))
+            conn.execute("INSERT INTO record_photos (kind, record_id, mime, data, added_by, created_at) VALUES (?,?,?,?,?,?)",
+                         ("purchases", head, photo["mime"], photo["data"], photo["added_by"], photo["created_at"]))
+            conn.execute("DELETE FROM record_photos WHERE kind='purchase_drafts' AND record_id=?", (did,))
+        if not conn.execute("DELETE FROM purchase_drafts WHERE id=?", (did,)).rowcount:
+            raise ValueError("already submitted")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        return err("Could not record this list. It may already have been submitted. Please check Purchases.", 409)
+    return jsonify({"ok": True, "count": len(ids), "total": total, "ids": ids}), 201
 
 
 @app.delete("/api/purchases/<int:pid>")
 @require("staff", "purchases")
 def delete_purchase(pid):
+    one = db().execute("SELECT trip_id FROM purchases WHERE id=?", (pid,)).fetchone()
+    if one and one["trip_id"] is not None:
+        return err("This item was bought together with others. Delete the whole purchase from the list.", 400)
     cur = db().execute("DELETE FROM purchases WHERE id=?", (pid,))
+    db().execute("DELETE FROM record_photos WHERE kind='purchases' AND record_id=?", (pid,))
+    db().commit()
+    return jsonify({"ok": True}) if cur.rowcount else err("Record not found.", 404)
+
+
+@app.delete("/api/purchase-trips/<int:tid>")
+@require("staff", "purchases")
+def delete_purchase_trip(tid):
+    """Deletes everything that was bought together, and its receipt photo."""
+    cur = db().execute("DELETE FROM purchases WHERE trip_id=?", (tid,))
+    db().execute("DELETE FROM record_photos WHERE kind='purchases' AND record_id=?", (tid,))
     db().commit()
     return jsonify({"ok": True}) if cur.rowcount else err("Record not found.", 404)
 
@@ -2188,7 +2074,7 @@ def list_expenses():
         + where + "ORDER BY e.date DESC, e.id DESC", args).fetchall()
     return jsonify({"total": sum(r["amount"] for r in rows), "categories": EXPENSE_CATEGORIES, "rows": [
         {"id": r["id"], "category": r["category"], "description": r["description"], "amount": r["amount"],
-         "date": r["date"], "recordedBy": r["by_name"]} for r in rows],
+         "date": r["date"], "recordedBy": r["by_name"], "hasPhoto": r["id"] in photo_ids("expenses")} for r in rows],
         "wastage": wastage_block(first)})
 
 
@@ -2269,34 +2155,196 @@ def add_expense():
 @require("staff", "expenses")
 def delete_expense(eid):
     cur = db().execute("DELETE FROM expenses WHERE id=?", (eid,))
+    db().execute("DELETE FROM record_photos WHERE kind='expenses' AND record_id=?", (eid,))
     db().commit()
     return jsonify({"ok": True}) if cur.rowcount else err("Record not found.", 404)
+
+
+# ---------- receipt photos on purchases and expenses ----------
+PHOTO_KINDS = {"purchases": "purchases", "purchase_drafts": "purchases", "expenses": "expenses"}       # URL part -> the access area that may use it
+PHOTO_MAX_BYTES = 1_500_000
+PHOTO_MAGIC = {"image/jpeg": (b"\xff\xd8\xff",), "image/png": (b"\x89PNG\r\n\x1a\n",), "image/webp": (b"RIFF",)}
+
+
+def photo_ids(kind):
+    """Ids of the records of this kind that have a photo (looked up once per request)."""
+    cache = g.setdefault("_photo_ids", {})
+    if kind not in cache:
+        cache[kind] = {r["record_id"] for r in db().execute("SELECT record_id FROM record_photos WHERE kind=?", (kind,))}
+    return cache[kind]
+
+
+@app.before_request
+def allow_photo_uploads():
+    # everything else is a tiny JSON body; only a receipt photo may be bigger
+    if request.method == "PUT" and re.fullmatch(r"/api/(purchases|purchase_drafts|expenses)/\d+/photo", request.path):
+        request.max_content_length = 2_300_000
+
+
+def parse_photo(value):
+    """A data URL from the browser -> (mime, base64) after checking it really is a small image, or (None, error)."""
+    m = re.fullmatch(r"data:(image/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)", value if isinstance(value, str) else "")
+    if not m:
+        return None, err("Please choose a photo (JPEG, PNG or WebP).")
+    mime, b64 = m.groups()
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except ValueError:
+        return None, err("That photo could not be read. Please try again.")
+    if len(raw) > PHOTO_MAX_BYTES:
+        return None, err("That photo is too big. Please take it again or choose a smaller one.", 413)
+    if not raw.startswith(PHOTO_MAGIC[mime]) or (mime == "image/webp" and raw[8:12] != b"WEBP"):
+        return None, err("That file is not a real photo.")
+    return (mime, b64), None
+
+
+@app.route("/api/<kind>/<int:rid>/photo", methods=["GET", "PUT", "DELETE"])
+@require("staff")
+def record_photo(kind, rid):
+    if kind not in PHOTO_KINDS:
+        return err("Not found.", 404)
+    if not can_access(g.user, PHOTO_KINDS[kind]):
+        return err("You don't have access to this section. Ask the owner.", 403)
+    conn = db()
+    found = (conn.execute("SELECT 1 FROM purchases WHERE id=? OR trip_id=?", (rid, rid)) if kind == "purchases"
+             else conn.execute(f"SELECT 1 FROM {kind} WHERE id=?", (rid,))).fetchone()
+    if not found:
+        return err("Record not found.", 404)
+    if request.method == "GET":
+        row = conn.execute("SELECT mime, data, created_at FROM record_photos WHERE kind=? AND record_id=?", (kind, rid)).fetchone()
+        if not row:
+            return err("No receipt photo on this record.", 404)
+        return jsonify({"image": f"data:{row['mime']};base64,{row['data']}", "addedAt": row["created_at"]})
+    if request.method == "DELETE":
+        conn.execute("DELETE FROM record_photos WHERE kind=? AND record_id=?", (kind, rid))
+        conn.commit()
+        return jsonify({"ok": True})
+    photo, e = parse_photo(body().get("image"))
+    if e:
+        return e
+    conn.execute("DELETE FROM record_photos WHERE kind=? AND record_id=?", (kind, rid))
+    conn.execute("INSERT INTO record_photos (kind, record_id, mime, data, added_by, created_at) VALUES (?,?,?,?,?,?)",
+                 (kind, rid, photo[0], photo[1], g.user["id"], now()))
+    conn.commit()
+    return jsonify({"ok": True})
 
 
 @app.get("/api/reports/staff")
 @require("staff", "team")
 def report_staff():
-    """Which staff members handled orders: started (accepted into the kitchen) and served."""
+    """What each staff member did: orders started and served, counter sales, payments confirmed, records entered."""
     name, first = get_range()
     if name is None:
         return err("Invalid period.")
+    fresh = lambda iso: bool(iso) and in_range(local_date(iso), first)
+    first_day = first.isoformat() if first else None
+    conn = db()
     started = {}
-    for o in db().execute("SELECT started_by, created_at FROM orders WHERE started_by IS NOT NULL"):
-        if in_range(local_date(o["created_at"]), first):
+    for o in conn.execute("SELECT started_by, created_at FROM orders WHERE started_by IS NOT NULL"):
+        if fresh(o["created_at"]):
             started[o["started_by"]] = started.get(o["started_by"], 0) + 1
-    served = {}
+    served, counter, waits = {}, {}, {}
     for o in served_orders(first):
-        if o["served_by"]:
-            row = served.setdefault(o["served_by"], [0, 0])
-            row[0] += 1
-            row[1] += o["total"]
+        sid = o["served_by"]
+        if not sid:
+            continue
+        row = served.setdefault(sid, [0, 0])
+        row[0] += 1
+        row[1] += o["total"]
+        if o["phone"] == "walk-in":
+            c = counter.setdefault(sid, [0, 0])
+            c[0] += 1
+            c[1] += o["total"]
+        elif o["served_at"]:
+            try:
+                mins = (datetime.strptime(o["served_at"], "%Y-%m-%dT%H:%M:%SZ") - datetime.strptime(o["created_at"], "%Y-%m-%dT%H:%M:%SZ")).total_seconds() / 60
+                waits.setdefault(sid, []).append(max(mins, 0))
+            except ValueError:
+                pass
+    confirmed = {}
+    for r in conn.execute("SELECT confirmed_by, confirmed_at, amount FROM payments WHERE confirmed_by IS NOT NULL AND status='Paid'"):
+        if fresh(r["confirmed_at"]):
+            c = confirmed.setdefault(r["confirmed_by"], [0, 0])
+            c[0] += 1
+            c[1] += r["amount"]
+
+    def entered(table):
+        q, args = "SELECT recorded_by, COUNT(*) AS n FROM " + table + " WHERE recorded_by IS NOT NULL", ()
+        if first_day:
+            q, args = q + " AND date >= ?", (first_day,)
+        return {r["recorded_by"]: r["n"] for r in conn.execute(q + " GROUP BY recorded_by", args)}
+    bought, spent, wasted = entered("purchases"), entered("expenses"), entered("wastage")
     rows = []
-    for s in db().execute("SELECT id, staff_id, name, role FROM staff"):
-        n_served, value = served.get(s["id"], [0, 0])
-        rows.append({"id": s["staff_id"], "name": s["name"], "role": s["role"],
-                     "started": started.get(s["id"], 0), "served": n_served, "salesValue": value})
+    for st in conn.execute("SELECT id, staff_id, name, role FROM staff"):
+        i = st["id"]
+        n_served, value = served.get(i, [0, 0])
+        n_counter, counter_value = counter.get(i, [0, 0])
+        n_paid, paid_value = confirmed.get(i, [0, 0])
+        w = waits.get(i)
+        rows.append({"id": st["staff_id"], "name": st["name"], "role": st["role"],
+                     "started": started.get(i, 0), "served": n_served, "salesValue": value,
+                     "counterSales": n_counter, "counterValue": counter_value,
+                     "paymentsConfirmed": n_paid, "paymentsValue": paid_value,
+                     "avgMinutes": round(sum(w) / len(w)) if w else None,
+                     "purchases": bought.get(i, 0), "expenses": spent.get(i, 0), "wastage": wasted.get(i, 0)})
     rows.sort(key=lambda r: (-r["salesValue"], -r["started"], r["name"]))
     return jsonify(rows)
+
+
+@app.get("/api/reports/dishes")
+@require("staff", "dishes")
+def report_dishes():
+    """Best sellers and slow movers among served orders in the period."""
+    name, first = get_range()
+    if name is None:
+        return err("Invalid period.")
+    conn = db()
+    sold = served_orders(first)
+    when = {o["id"]: (datetime.strptime(o["served_at"] or o["created_at"], "%Y-%m-%dT%H:%M:%SZ") + TZ_OFFSET) for o in sold}
+    menu = {m["id"]: m for m in conn.execute("SELECT * FROM menu")}
+    dishes, cats = {}, {}
+    ids = list(when)
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        for it in conn.execute("SELECT order_id, menu_id, name, price, qty FROM order_items WHERE order_id IN (%s)" % ",".join("?" * len(chunk)), chunk):
+            m = menu.get(it["menu_id"])
+            key = it["menu_id"] if m else "n:" + it["name"]
+            d = dishes.setdefault(key, {"name": m["name"] if m else it["name"], "category": m["category"] if m else "Other",
+                                        "qty": 0, "revenue": 0, "orders": set()})
+            d["qty"] += it["qty"]
+            d["revenue"] += it["qty"] * it["price"]
+            d["orders"].add(it["order_id"])
+            c = cats.setdefault(d["category"], {"category": d["category"], "qty": 0, "revenue": 0})
+            c["qty"] += it["qty"]
+            c["revenue"] += it["qty"] * it["price"]
+    total_rev = sum(d["revenue"] for d in dishes.values())
+    total_qty = sum(d["qty"] for d in dishes.values())
+
+    def out(d):
+        return {"name": d["name"], "category": d["category"], "qty": d["qty"], "revenue": d["revenue"], "orders": len(d["orders"]),
+                "share": round(d["revenue"] / total_rev * 100, 1) if total_rev else 0}
+    listed = [out(d) for d in dishes.values()]
+    slow = []
+    for k, m in menu.items():
+        if not m["available"]:
+            continue
+        d = dishes.get(k)
+        slow.append({"name": m["name"], "category": m["category"], "price": m["price"],
+                     "qty": d["qty"] if d else 0, "revenue": d["revenue"] if d else 0})
+    slow.sort(key=lambda r: (r["qty"], r["revenue"], r["name"]))
+    hours = [{"hour": h, "orders": 0, "sales": 0} for h in range(24)]
+    for o in sold:
+        h = hours[when[o["id"]].hour]
+        h["orders"] += 1
+        h["sales"] += o["total"]
+    return jsonify({
+        "range": name, "orders": len(sold), "dishesSold": total_qty, "revenue": total_rev,
+        "byQty": sorted(listed, key=lambda r: (-r["qty"], -r["revenue"], r["name"]))[:10],
+        "byRevenue": sorted(listed, key=lambda r: (-r["revenue"], r["name"]))[:10],
+        "slow": slow[:10], "neverSold": sum(1 for r in slow if r["qty"] == 0),
+        "categories": sorted(cats.values(), key=lambda r: -r["revenue"]),
+        "hours": hours,
+    })
 
 
 # ---------- owner: staff accounts & what staff may open ----------
@@ -2403,7 +2451,7 @@ def create_staff(argv):
 
 
 COPY_ORDER = ["staff", "customers", "menu", "combo_items", "orders", "order_items", "payments", "mpesa_receipts",
-              "purchases", "expenses", "drafts", "wastage", "feedback", "price_changes", "staff_access", "settings"]
+              "purchases", "expenses", "record_photos", "drafts", "purchase_drafts", "wastage", "feedback", "price_changes", "staff_access", "settings"]
 
 
 def migrate_to_postgres(argv):
