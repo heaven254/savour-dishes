@@ -21,7 +21,7 @@ saviour-backend/
   requirements.txt
   docker-compose.yml   a ready-made PostgreSQL database (optional)
   postgres-schema.sql  reference copy of the tables (the app creates them itself)
-  static/index.html the website (customer + staff/owner login)
+  static/index.html the website (staff and owner only)
   static/img/       logo and dish photos
 ```
 
@@ -31,6 +31,12 @@ After logging in, staff and the owner land on a **home screen** like a mobile-mo
 payments not yet confirmed, then a grid of icon tiles for every section they may open. Red numbers on the **Orders** and
 **Transactions** tiles show what needs attention. Tapping a tile opens that section; the **←** button (or the phone's back button)
 returns home. Sections the owner has switched off simply don't appear.
+
+## Light and dark theme
+
+Everyone (customers, staff and the owner) has a theme button at the top of every screen, including the login page. Tap it to cycle
+**🌗 Auto** (follows the phone's light/dark setting, the default), **☀️ Light** and **🌙 Dark**. The choice is remembered on that device only,
+not on the account, and Auto switches by itself when the phone's setting changes.
 
 ## Owner and staff
 
@@ -46,7 +52,7 @@ SD_ADMIN_PASSWORD="choose-a-strong-one" python app.py
 If you don't, the password is `saviour123`; change it before going live.
 
 In the **Access** tab the owner can add a staff member and tick or untick each section
-(Overview, Orders, Sales, Purchases, Expenses, Transactions, Staff report, Menu, Customers) for that person.
+(Overview, Business Today, Orders, Sales, Purchases, Expenses, Transactions, Profit & Loss, Staff report, Best Sellers, Menu) for that person.
 Changes apply straight away, even if the staff member is signed in.
 
 From the command line instead: `python app.py create-staff jane "Jane Doe" Staff`
@@ -57,32 +63,39 @@ Older databases are upgraded automatically (Manager becomes Owner; other roles b
 
 | Method | Path | Who |
 |---|---|---|
-| POST | /api/register `{phone, name?, location?}` | anyone (phone number only) |
-| POST | /api/login/customer `{phone}`, /api/login/staff `{id, password}` | anyone |
-| PUT, DELETE | /api/me/location | customer (optional location on her account) |
+| POST | /api/login/staff `{id, password}` | anyone |
 | POST | /api/logout, GET /api/me | logged in |
 | GET | /api/menu | anyone |
-| PATCH | /api/menu/<id> `{available: bool}` and/or `{price: int}` | *menu* access to switch on/off, *sales* access to change a price |
+| POST | /api/menu `{name, category, price, emoji?, description?}` | *menu* access (adds a dish) |
+| PUT, DELETE | /api/menu/<id> | *menu* access (edit or remove a dish; a dish inside a combo can't be deleted) |
+| PATCH | /api/menu/<id> `{available: bool}` and/or `{price: int}` | *menu* access to switch on/off; *menu* or *sales* access to change a price |
 | GET | /api/price-changes | *sales* access |
 | POST, PUT, DELETE | /api/combos, /api/combos/<id> | *sales* access |
-| POST | /api/orders `{items, service, location, total?, geo?, payment?}` | customer (`geo` optional; `payment` is `{method: "KCB Till"\|"Cash", reference?}`, cash if left out) |
-| GET | /api/orders/mine | customer |
 | GET | /api/orders | *orders* access |
 | PATCH | /api/orders/<SD0001> `{status}` | *orders* access (Pending → Preparing → Served) |
 | GET | /api/payment-info | anyone (payment methods and the till number) |
 | PUT | /api/settings/till `{till}` | owner only |
-| POST | /api/orders/<SD0001>/payment-ref `{reference}` | customer (adds the M-Pesa code later) |
 | GET | /api/transactions?limit=&offset=&method=&status=&from=&to=&q= | *transactions* access (default: last 20) |
 | PATCH | /api/transactions/<TX0001> `{status: Paid\|Failed}` | *transactions* access |
-| POST | /api/orders/<SD0001>/stk-push `{phone?}` | customer (sends the M-Pesa prompt) |
 | GET | /api/mpesa/status | owner only |
-| POST | /api/pay/stk/<secret>, /api/pay/c2b/<secret>/confirmation, /validation | Safaricom only (secret is in the address) |
-| GET | /api/customers | *customers* access |
-| GET | /api/reports/overview?range= | *overview* access |
+| POST | /api/pay/c2b/<secret>/confirmation, /validation | Safaricom only (secret is in the address) |
+| GET | /api/reports/overview?range= | *overview* access (daily sales, purchases and expenses for the graph) |
+| GET | /api/reports/today?date= | *today* access (Business Today) |
+| PUT | /api/orders/<SD0001>/payments `{parts: [{method, amount, status?, reference?}]}` | *transactions* access (split or change what is still unpaid) |
+| POST | /api/sales `{items, service?, location?, parts?, draft_id?}` | *sales* access (counter sale, recorded as served) |
+| GET, POST, PUT, DELETE | /api/drafts, /api/drafts/<id> | *sales* access |
+| POST, DELETE | /api/wastage, /api/wastage/<id> | *expenses* access (GET: the `wastage` block of /api/expenses) |
 | GET | /api/sales?range= | *sales* access |
 | GET, POST, DELETE | /api/purchases | *purchases* access |
 | GET, POST, DELETE | /api/expenses | *expenses* access |
-| GET | /api/reports/staff?range= | *team* access |
+| GET, PUT, DELETE | /api/purchases/<id>/photo (id of a single purchase or of a trip), /api/purchase_drafts/<id>/photo, /api/expenses/<id>/photo `{image}` | the same section's access (a receipt photo; PUT takes a JPEG/PNG/WebP data URL up to 1.5 MB) |
+| GET, POST | /api/purchase-drafts | the Purchases section (list drafts; start a draft `{label, date, lines}`) |
+| PUT, DELETE | /api/purchase-drafts/<id> | the Purchases section (save or delete a draft) |
+| DELETE | /api/purchase-trips/<id> | the Purchases section (deletes everything bought together, and its photo) |
+| POST | /api/purchase-drafts/<id>/submit | the Purchases section (records every line as a purchase, then removes the draft) |
+| GET | /api/reports/staff?range= | *team* access (started, served, counter sales, payments confirmed, average wait, records entered) |
+| GET | /api/reports/dishes?range= | *dishes* access (best sellers, slow movers, busy hours, income by category) |
+| GET | /api/receipts/<SD0001> | staff with *orders*, *sales* or *transactions* access |
 | GET, PUT | /api/access, /api/access/<staff_id> `{area, allowed}` | owner only |
 | POST | /api/staff `{id, name, password}` | owner only |
 
@@ -94,17 +107,84 @@ Dates use East Africa Time by default; change with `SD_TZ_HOURS` (e.g. `SD_TZ_HO
 
 - Passwords are hashed; login tokens are stored hashed and expire after 12 hours.
 - Order prices and availability are always taken from the database, never from the browser.
-- To let customers on other devices use it, run with `SD_HOST=0.0.0.0` and put it behind HTTPS
-  (e.g. nginx or a host like Render/Railway) before using real customer data.
+- To let staff on other devices use it, run with `SD_HOST=0.0.0.0` and put it behind HTTPS
+  (e.g. nginx or a host like Render/Railway).
 
 ## Menu, photos and logo
 
 The menu (35 dishes, copied from the board on the wall) is in `SEED_MENU` in `app.py`.
 It is loaded into the database the first time the app runs; an older sample menu is replaced automatically.
 
+- **The logo and the six dish photos are also built into `index.html`**, so the site never shows a broken picture, even if the `img` folder isn't uploaded
+  (a photo that can't load turns into the dish's emoji avatar). Every other dish has a round emoji avatar tinted by its category, light or dark.
+  To change the logo or a photo, update the picture files *and* the copy inside `index.html`, or ask for it to be regenerated.
 - **Logo:** `static/img/logo.png`. Replace the file with a cleaner copy any time (a clear, straight-on image works best).
 - **Dish photos:** a dish shows a round photo if it is listed in `DISH_PHOTOS` in `app.py`; otherwise an emoji avatar.
   Add a photo by copying the file into `static/img/` and adding `"Dish name": "file.jpg"`, then restart. No database change needed.
+
+## Business Today, counter sales, split payments and wastage
+
+- **Business Today** (staff tile): what happened on a day, today by default, or pick another day. Sales, profit after costs, purchases, expenses, food wasted, money received (cash / till / waiting to be confirmed), orders, sales by hour, best sellers, who served, and a timeline of everything that happened. The owner can switch it off for staff under **Access**.
+- **Overview** now graphs sales, purchases and expenses as three separate bars per day, with a table underneath.
+- **Sales -> New sale / Drafts:** tap dishes to make a counter sale (recorded as served, under "Walk-in customer"). Pay cash, till or split. **Save as draft** keeps it for later; drafts are not counted as sales until completed.
+- **Split payment:** a sale can be part cash, part till. Staff can split or change what is still unpaid with **Split / change** on an order. Each part is confirmed on its own in Transactions. A confirmed part never changes.
+- **Expenses -> Food Wastage:** record food thrown away (item, quantity, cost, reason). It is shown beside expenses, in Overview, Business Today and Profit & Loss, but never subtracted twice, because the money was already spent on purchases.
+- **Purchases:** type the quantity, pick a unit (kg, litres, bags...) and the price per unit; the total amount fills in by itself.
+- Existing databases upgrade by themselves on the next start.
+
+## Receipts, Best Sellers and Staff report
+
+- **Receipts.** Customers get a **🧾 Receipt** button on each order that isn't cancelled. Staff get it in Orders, in the sales log,
+  and a receipt opens straight after a counter sale. A receipt can be **printed** (or saved as PDF from the print screen)
+  or sent on **WhatsApp**. Staff sharing a customer's receipt open WhatsApp already addressed to her number.
+  The receipt shows PAID or PAYMENT PENDING, so it doubles as a bill.
+- **Best Sellers** (own tile, own access switch, so the owner can hide it from staff). Uses served orders for the period picked:
+  most sold or most income, slow movers (dishes on the menu that sold least, including ones that sold nothing),
+  the busiest hours of the day and income by category. Dishes switched off on the menu are left out of slow movers.
+- **Staff report** now also shows counter sales, payments confirmed, average minutes from order to served (customer orders only)
+  and how many purchases, expenses and wastage records each person entered.
+
+## Receipt photos
+
+On **Purchases** and **Expenses**, the form has **📷 Take photo** (opens the phone camera) and **🖼️ Choose photo** (from the gallery). The photo is saved
+with the record. A record saved without one has **📷 Add** in its list row, and a record with one has **🧾 View** (tap the photo to zoom, **Replace** or **Remove**).
+Photos are shrunk on the phone to about 200-500 KB first, checked by the server (real JPEG/PNG/WebP, 1.5 MB at most) and kept **in the database**
+(so they survive Render deploys). Deleting a purchase or expense deletes its photo. They follow the section's access switch, so staff who
+can't open Expenses can't see its receipts. Rough size: 1,000 photos is about 300 MB, so check your database plan's storage now and then.
+
+## Purchase drafts and things bought together
+
+When you buy several things in one trip, add them to a draft list instead of recording each one straight away. On the Purchases page, fill in the item and press **Add to draft list instead**. The draft saves itself after every change, so you can close the app and come back. Open it later from the **Drafts** tab (Open or Delete). Give the draft one receipt photo for the whole list (Take photo / Choose photo on the draft, or on the form when you add an item).
+
+Press **Submit all purchases** and every line is recorded, all together or not at all, using the draft's date and your name. Items bought together show as **one line** in the Purchases list (the draft's name, the combined total and the receipt). Tap the line to see the items inside; Delete on that line removes the whole purchase. A list with a single item is recorded as a normal purchase. Drafts do not count in any total or report until they are submitted; each item counts once in the reports.
+
+## Line graphs
+
+Overview shows sales, purchases and expenses as a **line graph** (one line each, a dot per day). Tap or hover a day to read its numbers
+below the graph; long periods scroll sideways, opening on the latest days, with the amounts on the left staying in view.
+Profit & Loss uses the same graph for sales against purchases plus expenses.
+
+## Profit & Loss
+
+Staff dashboard -> **Profit & Loss**. Pick Today, Yesterday, This week, This month, Last month or This year, or search by a single day, a month, a year or custom dates.
+
+- **Statement:** Sales, less Purchases = Gross profit, less Expenses (by category) = Net profit or loss, with the previous period beside it and the change.
+- **Money received:** cash, KCB Till, and sales not yet confirmed.
+- **Day by day** (or month by month for long periods) chart, top dishes, sales by category, purchases by item.
+- **Records:** the sales, purchases and expenses behind the figures, plus a **CSV download**.
+- Sales count when an order is marked **Served**. Purchases and expenses count on their recorded date.
+- The owner can switch this section off for staff under **Access**.
+
+API: `GET /api/reports/pnl?from=YYYY-MM-DD&to=YYYY-MM-DD`
+
+## Managing the menu
+
+In the staff **Menu** tile, staff and the owner can:
+- **Add a dish:** name, category (pick an existing one or type a new one, which creates a new menu section), price, an emoji for its avatar, and an optional description. It shows on customers' menus straight away.
+- **Change a price:** type the new price in the dish's box and tap **Save price**. Orders already placed keep the price they were made at, and every change is logged in Sales → Item prices.
+- **Edit or remove:** **Edit** changes any detail; **Delete** removes a dish (past orders keep its name and price). A dish that is part of a combo can't be deleted until the combo is changed. Use **Mark unavailable** to hide a dish for a while.
+- New dishes get an emoji avatar. Photos are built into the page for the original six dishes only, and renaming one of those turns it into an emoji avatar.
+- The owner can switch the Menu section off for staff in **Access**. The starter menu is loaded once, so dishes you add or remove are never undone when the app restarts.
 
 ## Prices and combos
 
@@ -116,25 +196,22 @@ In the **Sales** tab there are three views: Sales log, Item prices and Combos.
   A combo is unavailable while any dish in it is switched off. The kitchen sees what is inside each combo on the order.
 - The owner controls this with the **Sales** access box in the Access tab.
 
-## Customer sign-in and location
+## Staff only
 
-- **Phone number only.** Customers sign up and log in with just their phone number (name is optional).
-  Numbers are stored in one standard form, so `0712 345 678`, `712345678` and `+254712345678` are the same customer.
-  Staff still use an ID and password.
-- **Location is optional and always the customer's choice.** She can share it when signing up, from **My Account**,
-  or with a single order at checkout. It is never taken automatically.
-  Staff see an "Open map" link next to the customer on each order (and in the Customers tab).
-  The order's own location is shown if she shared one, otherwise the one saved on her account.
-  The coordinates are never sent back to customers' browsers, and she can remove a saved location any time.
-- Browsers only allow location sharing on `https://` addresses or `localhost`, so put the site behind HTTPS when you go live.
-- Older databases are upgraded automatically: emails and passwords are dropped and phone numbers are standardised.
-- **Trade-off to know about:** anyone who knows a customer's phone number can log in as her and see her order history.
-  If that matters, the usual next step is a one-time code sent by SMS (needs an SMS service) or a short PIN.
+The website is for **staff and the owner only**. There is no customer sign-up, menu, cart or order page, and no customer text-message codes.
+Staff enter every sale themselves under **Sales -> New sale** (cash, till or split; save a draft for a table that is still eating),
+and can print or WhatsApp a receipt straight after.
+
+- **Older data is kept.** Customer accounts, their old orders and their feedback stay in the database, and old orders still show in
+  **Orders**, Transactions, reports and receipts under the customer's name. Nobody can log in as a customer any more, and any customer
+  sign-ins still open are ended when the app starts. Nothing is deleted from the database.
+- **Settings no longer needed:** `SD_AT_USERNAME`, `SD_AT_KEY`, `SD_AT_SENDER`, `SD_AT_ENV` and `SD_SMS_CONSOLE` (text messages) do nothing now and can be removed from Render.
+- **If you ever want customers back**, the earlier version of the app (with customer sign-in, ordering, feedback and receipts) is the one to go back to.
 
 ## Payments and transactions
 
-- **At checkout** the customer chooses **Cash** or **KCB Till (M-Pesa)**. For the till she is shown your till number
-  and can type the M-Pesa confirmation code from her payment message, now or later from **My Orders**.
+- **When entering a sale** staff choose **Cash**, **KCB Till (M-Pesa)** or part of each, and can type the M-Pesa confirmation code
+  from the customer's payment message (now, or later when it is known).
 - **The owner sets the till number** in the **Transactions** tab (or start the app with `SD_KCB_TILL=123456`).
 - **Without the automatic setup below** the app cannot see M-Pesa, so it cannot confirm that money arrived by itself.
   A staff member or the owner checks the payment (cash in hand, or the code in the till's SMS / KCB statement)
@@ -144,18 +221,21 @@ In the **Sales** tab there are three views: Sales log, Item prices and Combos.
 - **Transactions tab** (staff and owner; the owner can switch it off for staff in Access): the last 20 transactions first,
   totals confirmed by method, and **Show more** to page back through the whole history.
   Filter by method, status, dates, or search by name, phone, order number or M-Pesa code.
-- Orders placed before this update have no payment record and don't appear in Transactions.
+- Orders from before payments were recorded have no payment record and don't appear in Transactions.
 
 ## Automatic M-Pesa confirmation (optional)
 
 It is **off until you set it up**; until then staff confirm by hand and nothing else changes.
 
 When it is on:
-1. After a customer places a till order, a **payment prompt** pops up on her phone (her account number, or another number she types under **Pay now**).
-2. When she enters her PIN, Safaricom tells the app, and the payment turns **Paid** by itself, marked "confirmed automatically".
-3. If she paid the till by hand instead, Safaricom's till notification plus the M-Pesa code she types confirms it the same way, whichever arrives first.
-4. If she cancels, the wrong PIN is used, or she pays too little, the payment stays "Not confirmed" with the reason, and staff decide.
+1. A customer pays the till by M-Pesa. Safaricom tells the app about the payment.
+2. Staff enter the M-Pesa code from the customer's message on the sale (when the sale is entered, or later by changing the payment).
+   As soon as the code and a till notification for at least the right amount are both there, the payment turns **Paid** by itself,
+   marked "confirmed automatically". It doesn't matter which arrives first.
+3. If the customer paid too little, the payment stays "Not confirmed" with the reason, and staff decide.
    An underpayment is never confirmed automatically.
+
+The payment prompt that used to pop up on the customer's phone is gone together with the customer side.
 
 **Set-up (uses Safaricom's Daraja service):**
 1. Register at developer.safaricom.co.ke, create an app, and get the consumer key and secret. Test in the sandbox first.
@@ -165,21 +245,20 @@ When it is on:
 ```
 SD_MPESA_ENV=sandbox            # change to production when you go live
 SD_MPESA_KEY=...  SD_MPESA_SECRET=...
-SD_MPESA_SHORTCODE=...          # the shortcode/store number the prompts are sent from, and the passkey for it
-SD_MPESA_PASSKEY=...
+SD_MPESA_SHORTCODE=...          # your till/store number as registered with Safaricom
 SD_MPESA_TILL=...               # your till number, if different from the shortcode
 SD_PUBLIC_URL=https://your-site.example
 python app.py
 ```
 
-4. For till notifications (step 3 above), run `python app.py mpesa-register` once. The owner's **Transactions** tab also shows the two addresses Safaricom should use.
+4. To receive till notifications, run `python app.py mpesa-register` once. The owner's **Transactions** tab also shows the two addresses Safaricom should use.
    Paybill instead of a Buy Goods till: add `SD_MPESA_TYPE=paybill`.
 
 **Check before relying on it:** this was tested here against simulated Safaricom replies, not the live service.
-Whether a till issued through KCB can be used with Daraja, and which shortcode and passkey to use for it, is for Safaricom or KCB to confirm.
+Whether a till issued through KCB can be used with Daraja, and which shortcode to use for it, is for Safaricom or KCB to confirm.
 Run a small real payment in the sandbox and then in production before you stop checking by hand.
 The callbacks are protected only by the secret in their address (Safaricom doesn't sign them), so keep the addresses private.
-A customer who types someone else's unused M-Pesa code for the same amount could be confirmed by mistake. That is why the prompt, which is tied to her own phone, is the safer route.
+A wrong or someone else's unused M-Pesa code typed in for the same amount could be confirmed by mistake, so check the code against the customer's message.
 
 ## PostgreSQL
 
@@ -223,5 +302,6 @@ python app.py migrate-to-postgres saviour.db
 | `SD_KCB_TILL` | your till number (optional; the owner can also set it in the app) |
 
    For automatic M-Pesa add `SD_PUBLIC_URL` (your Render address, `https://your-app.onrender.com`) and the `SD_MPESA_*` values listed above.
-4. Don't set `SD_HOST` or `SD_PORT` (Render gives the port). Render serves the site over HTTPS, which customers' location sharing needs.
-5. Render's disk is wiped on every deploy, so keep everything in PostgreSQL, not the SQLite file. Check your database plan's expiry and backups on Render.
+4. Don't set `SD_HOST` or `SD_PORT` (Render gives the port). Render serves the site over HTTPS.
+5. The website files must be in a folder called `static` (lowercase `Static` also works). If the page says "Not Found", the folder is missing or misnamed in your repo.
+6. Render's disk is wiped on every deploy, so keep everything in PostgreSQL, not the SQLite file. Check your database plan's expiry and backups on Render.

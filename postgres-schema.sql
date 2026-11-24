@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS customers (
     id SERIAL PRIMARY KEY ,
     name TEXT NOT NULL, phone TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL,
-    lat DOUBLE PRECISION, lng DOUBLE PRECISION, accuracy DOUBLE PRECISION, location_at TEXT
+    lat DOUBLE PRECISION, lng DOUBLE PRECISION, accuracy DOUBLE PRECISION, location_at TEXT,
+    password_hash TEXT, phone_verified INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS staff (
     id SERIAL PRIMARY KEY ,
@@ -39,7 +40,9 @@ CREATE TABLE IF NOT EXISTS purchases (
     id SERIAL PRIMARY KEY ,
     item TEXT NOT NULL, supplier TEXT NOT NULL DEFAULT '',
     qty DOUBLE PRECISION NOT NULL, unit_cost DOUBLE PRECISION NOT NULL, total INTEGER NOT NULL,
-    date TEXT NOT NULL, recorded_by INTEGER, created_at TEXT NOT NULL
+    date TEXT NOT NULL, recorded_by INTEGER, created_at TEXT NOT NULL,
+    unit TEXT NOT NULL DEFAULT '',
+    trip_id INTEGER, trip_label TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS expenses (
     id SERIAL PRIMARY KEY ,
@@ -63,15 +66,43 @@ CREATE TABLE IF NOT EXISTS staff_access (
 );
 CREATE TABLE IF NOT EXISTS payments (
     id SERIAL PRIMARY KEY ,
-    order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id),
+    order_id INTEGER NOT NULL REFERENCES orders(id),
     method TEXT NOT NULL, amount INTEGER NOT NULL,
     reference TEXT, status TEXT NOT NULL DEFAULT 'Pending',
     created_at TEXT NOT NULL, confirmed_by INTEGER, confirmed_at TEXT,
     checkout_id TEXT, note TEXT, auto INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS payments_order_idx ON payments(order_id);
+CREATE TABLE IF NOT EXISTS drafts (
+    id SERIAL PRIMARY KEY,
+    label TEXT NOT NULL DEFAULT '', service TEXT NOT NULL DEFAULT 'Dine in', location TEXT NOT NULL DEFAULT '',
+    items TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+    created_by INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS purchase_drafts (
+    id SERIAL PRIMARY KEY,
+    label TEXT NOT NULL DEFAULT '', date TEXT NOT NULL, lines TEXT NOT NULL,
+    created_by INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedback (
+    id SERIAL PRIMARY KEY,
+    order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id),
+    customer_id INTEGER NOT NULL, rating INTEGER, comment TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wastage (
+    id SERIAL PRIMARY KEY,
+    item TEXT NOT NULL, qty DOUBLE PRECISION, unit TEXT NOT NULL DEFAULT '', cost INTEGER NOT NULL,
+    reason TEXT NOT NULL, date TEXT NOT NULL, recorded_by INTEGER, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS mpesa_receipts (
     trans_id TEXT PRIMARY KEY, amount DOUBLE PRECISION NOT NULL, phone TEXT,
     source TEXT NOT NULL, received_at TEXT NOT NULL, matched_payment INTEGER
+);
+CREATE TABLE IF NOT EXISTS record_photos (
+    kind TEXT NOT NULL, record_id INTEGER NOT NULL, mime TEXT NOT NULL, data TEXT NOT NULL,
+    added_by INTEGER, created_at TEXT NOT NULL,
+    PRIMARY KEY (kind, record_id)
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (
